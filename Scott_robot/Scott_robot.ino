@@ -35,10 +35,14 @@ HardwareSerial SerialGPS(2);
 TinyGPS gps;
 uint32_t timeout_gps = 0; 
 
-// Waypoints GPS Alvo
+// Waypoints GPS Fila e Segurança
 bool modo_waypoints = false;
-float target_lat = 0.0;
-float target_lon = 0.0;
+float waypoints_lat[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+float waypoints_lon[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+int total_waypoints = 0;
+int waypoint_atual_idx = 0;
+bool wp_evita_queda = true;
+bool wp_evita_colisao = true;
 
 // --- MÁQUINA DE ESTADOS WAYPOINT ---
 enum EstadoWaypoint { WAY_LIVRE, WAY_RE, WAY_GIRO };
@@ -46,7 +50,7 @@ EstadoWaypoint estadoWay = WAY_LIVRE;
 unsigned long posicao_inicial_way = 0;
 uint32_t alvoPulsosWay = 0;
 uint32_t tempo_inicio_manobra_way = 0;
-int sentido_giro_way = 1; // 1 para direita, -1 para esquerda
+int sentido_giro_way = 1; 
 
 // --- VARIÁVEIS DE ODOMETRIA E FUSÃO (Dead Reckoning) ---
 const float CM_POR_PULSO = 30.0 / 100.0;
@@ -61,18 +65,15 @@ unsigned long odo_dir_anterior = 0;
 bool odometria_inicializada = false;
 bool heading_gps_valido = false; 
 
-// Variáveis para a Calibração Geométrica do GPS (Ignora o vetor cego)
 float lat_inicio_calibracao = 0.0;
 float lon_inicio_calibracao = 0.0;
-unsigned long pulsos_inicio_calibracao = 0; // NOSSA NOVA RÉGUA FÍSICA
+unsigned long pulsos_inicio_calibracao = 0; 
 bool registrou_inicio_calibracao = false;
 
 int sinal_esq = 0; 
 int sinal_dir = 0; 
 
-// -------------------------------------------------------------------
-// ALVOS DE PULSOS PARA MANOBRAS (Disco de 10 dentes)
-// -------------------------------------------------------------------
+// ALVOS DE PULSOS PARA MANOBRAS
 const uint32_t PULSOS_30_CM = 100;  
 const uint32_t PULSOS_20_CM = 67;  
 const uint32_t PULSOS_15_CM = 50;  
@@ -80,9 +81,7 @@ const uint32_t PULSOS_180_GRAUS = 260;
 const uint32_t PULSOS_90_GRAUS = 130;  
 const uint32_t PULSOS_45_GRAUS = 65;   
 
-// -------------------------------------------------------------------
 // MAPEAMENTO E VARIÁVEIS DOS ENCODERS
-// -------------------------------------------------------------------
 const int PINO_ENC_ESQ_A = 21; 
 const int PINO_ENC_ESQ_B = 22; 
 const int PINO_ENC_DIR_A = 19; 
@@ -109,10 +108,8 @@ const char *ALIAS_VELOCIDADE = "velocidade";
 const char *ALIAS_VBAT = "vbat";
 const char *ALIAS_LED = "led";
 const char *ALIAS_IP = "ip"; 
-
 const char *ALIAS_WIFI_SSID = "wifi_ssid";
 const char *ALIAS_WIFI_PASS = "wifi_pass";
-
 const char *ALIAS_ESPERA = "pausa";
 const char *ALIAS_KP = "kp";
 const char *ALIAS_KI = "ki";
@@ -177,7 +174,6 @@ EstadoManobra estadoManobraAtual = LIVRE;
 unsigned long posicao_inicial_manobra = 0;
 uint32_t alvoPulsosManobra = 0;
 
-// Máquina de estados para Exploração Autônoma
 enum EstadoExploracao { EXPLORA_LIVRE, EXPLORA_RE, EXPLORA_GIRO, EXPLORA_PARADO };
 EstadoExploracao estadoExplora = EXPLORA_LIVRE;
 int giros_consecutivos = 0; 
@@ -212,30 +208,19 @@ const char index_html[] PROGMEM = R"rawliteral(
         .battery { top: 50%; left: 50%; transform: translate(-50%, -50%); height: 20px; width: 40px; border: 2px solid #F1F1F1; border-radius: 5px; padding: 1px; }
         .battery::before { content: ''; position: absolute; height: 13px; width: 3px; background: #F1F1F1; left: 44px; top: 50%; transform: translateY(-50%); border-radius: 0 3px 3px 0; }
         .part { background: #0F0; top: 1px; left: 1px; bottom: 1px; border-radius: 3px; }
-        .grid-3x3 { border-collapse: collapse; margin: 0 auto; background: #fff; width: 110%; max-width: 400px; }
-        .grid-3x3 td { padding: 8px; border: 2px solid #ECE5E5; text-align: center; }
+        
+        /* Ajuste na Tabela Principal para caber na tela */
+        .grid-3x3 { border-collapse: collapse; margin: 0 auto; background: #fff; width: 100%; max-width: 400px; font-size: 13px; }
+        .grid-3x3 td { padding: 6px; border: 2px solid #ECE5E5; text-align: center; }
 
         #btn-led-linha, #btn-led-colisao, #btn-led-explora {
-            padding: 16px 20px;
-            font-size: 16px;
-            font-family: inherit;
-            background-color: #444;
-            color: #fff;
-            border: 3px solid #666;
-            border-radius: 10px;
-            cursor: pointer;
-            user-select: none;
-            transition: background-color 0.15s;
-            -webkit-tap-highlight-color: transparent;
-            outline: none;
-            width: 100px;
+            padding: 16px 20px; font-size: 16px; font-family: inherit; background-color: #444; color: #fff; border: 3px solid #666; border-radius: 10px; cursor: pointer; user-select: none; transition: background-color 0.15s; outline: none; width: 100px;
         }
         #btn-led-linha.on, #btn-led-colisao.on, #btn-led-explora.on { background-color: #f0be00; border-color: #c49a00; color: #000; font-weight:bold;}
         #btn-led-linha:disabled, #btn-led-colisao:disabled, #btn-led-explora:disabled { background-color: #eee; border-color: #ccc; color: #999; cursor: not-allowed; }
 
         .menu { display: flex; background-color: #222; border-bottom: 2px solid #444; height: 40px; }
         .menu-item { flex: 1; text-align: center; line-height: 40px; color: #ccc; font-size: 16px; cursor: pointer; user-select: none; transition: background-color 0.15s, color 0.15s; border-bottom: 3px solid transparent; }
-        .menu-item:hover { background-color: #333; }
         .menu-item.active { color: #f0be00; border-bottom-color: #f0be00; background-color: #333; }
         .tab-content { display: none; height: calc(100% - 76px); overflow-y: auto; }
         .tab-content.active { display: block; }
@@ -260,7 +245,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         </div>
         <div style="float: right; color: white; font-size: 18px; line-height: 26px; margin-right: 5px;"><span id="vbat">0</span> V</div>
         <div style="width: 100%; text-align: center;">
-            <span style="color: #f0be00; font-weight: bold; font-size: 16px;">SCOTT ROBOT - WAYPOINTS GPS</span>
+            <span style="color: #f0be00; font-weight: bold; font-size: 16px;">SCOTT ROBOT</span>
         </div>
     </div>
     <div class="menu">
@@ -275,8 +260,8 @@ const char index_html[] PROGMEM = R"rawliteral(
         <div style="display: table; width:100%; height: 100%;">
             <div style="display: table-cell; vertical-align: middle;">
                 <div style="display: flex; align-items: center; justify-content: space-evenly; align-content: center; flex-direction: row; flex-wrap: wrap;">
-                    <div style="text-align: center; margin-bottom: 20px;">
-                        <table id="radar" class="grid-3x3" style="font-size: 14px;">
+                    <div style="text-align: center; margin-bottom: 20px; width: 100%;">
+                        <table id="radar" class="grid-3x3">
                             <tr><td><b>Date</b></td><td><b>Time</b></td><td><b>Lat</b></td><td><b>Lon</b></td></tr>
                             <tr><td><span id="gps-date">--/--/----</span></td><td><span id="gps-time">--:--:--</span></td><td><span id="gps-lat">--</span></td><td><span id="gps-lon">--</span></td></tr>
                             <tr><td><b>Dist:</b> <span id="distance">--</span> cm</td><td><b>Power:</b> <span id="table-speed">0</span> %</td><td colspan="2"><b>Speed:</b> <span id="robot-speed">0.0</span> cm/s</td></tr>
@@ -284,18 +269,9 @@ const char index_html[] PROGMEM = R"rawliteral(
                     </div>
                     <canvas id="canvas_joystick"></canvas>
                     <div style="display: flex; width: 100%; justify-content: space-around; align-items: center; margin-top: 15px;">
-                        <div style="text-align: center;">
-                            <button id="btn-led-linha" onclick="toggleLed('linha')">Line</button>
-                            <div style="color: gray; margin-top: 5px; font-size: 10px;" id="led-status-linha">OFF</div>
-                        </div>
-                        <div style="text-align: center;">
-                            <button id="btn-led-explora" onclick="toggleLed('explora')">Explore</button>
-                            <div style="color: gray; margin-top: 5px; font-size: 10px;" id="led-status-explora">OFF</div>
-                        </div>
-                        <div style="text-align: center;">
-                            <button id="btn-led-colisao" onclick="toggleLed('colisao')">Collision</button>
-                            <div style="color: gray; margin-top: 5px; font-size: 10px;" id="led-status-colisao">OFF</div>
-                        </div>
+                        <div style="text-align: center;"><button id="btn-led-linha" onclick="toggleLed('linha')">Line</button><div style="color: gray; margin-top: 5px; font-size: 10px;" id="led-status-linha">OFF</div></div>
+                        <div style="text-align: center;"><button id="btn-led-explora" onclick="toggleLed('explora')">Explore</button><div style="color: gray; margin-top: 5px; font-size: 10px;" id="led-status-explora">OFF</div></div>
+                        <div style="text-align: center;"><button id="btn-led-colisao" onclick="toggleLed('colisao')">Collision</button><div style="color: gray; margin-top: 5px; font-size: 10px;" id="led-status-colisao">OFF</div></div>
                     </div>
                     <div id="fall-message-container" style="width: 100%; text-align: center; margin-top: 15px;">
                         <span id="fall-status-text" style="font-size: 18px; font-weight: bold; color: #ccc; transition: color 0.2s;"></span><br>
@@ -315,12 +291,24 @@ const char index_html[] PROGMEM = R"rawliteral(
 
     <div id="tab-waypoint" class="tab-content">
         <div class="setup-container">
-            <div class="setup-box">
+            <div class="setup-box" style="max-width: 360px;">
                 <span class="setup-title">Navegação por Waypoints</span>
-                <p style="font-size: 14px; color: gray; margin-top: 0;">Insira as coordenadas de destino (ao ar livre) para o Scott navegar autonomamente.</p>
-                <div class="input-group"><div class="input-group-addon">Lat</div><input type="text" id="target_lat" placeholder="-22.85817" class="input"></div>
-                <div class="input-group"><div class="input-group-addon">Lon</div><input type="text" id="target_lon" placeholder="-46.97656" class="input"></div>
-                <button type="button" class="btn" onclick="usarLocalizacaoAtual()" style="background-color: #2196F3; color: white;">Usar Localização Atual</button>
+                <div id="wp-current-loc" style="text-align: center; font-weight: bold; color: #2196F3; margin-bottom: 10px; font-size: 15px;">Lat: -- | Lon: --</div>
+                
+                <table style="width: 100%; text-align: center; border-collapse: collapse; margin-bottom: 15px; font-size: 13px;">
+                    <tr style="background:#eee; height:30px;"><th>ID</th><th>Lat</th><th>Lon</th><th>Ação</th></tr>
+                    <tr><td>1</td><td><input type="number" id="wp_lat_1" class="input" style="width:85%; padding:4px; height:24px;"></td><td><input type="number" id="wp_lon_1" class="input" style="width:85%; padding:4px; height:24px;"></td><td><button class="btn btn-warning" style="height:28px; padding:0; width:45px; margin:0;" onclick="setWp(1)">Set</button></td></tr>
+                    <tr><td>2</td><td><input type="number" id="wp_lat_2" class="input" style="width:85%; padding:4px; height:24px;"></td><td><input type="number" id="wp_lon_2" class="input" style="width:85%; padding:4px; height:24px;"></td><td><button class="btn btn-warning" style="height:28px; padding:0; width:45px; margin:0;" onclick="setWp(2)">Set</button></td></tr>
+                    <tr><td>3</td><td><input type="number" id="wp_lat_3" class="input" style="width:85%; padding:4px; height:24px;"></td><td><input type="number" id="wp_lon_3" class="input" style="width:85%; padding:4px; height:24px;"></td><td><button class="btn btn-warning" style="height:28px; padding:0; width:45px; margin:0;" onclick="setWp(3)">Set</button></td></tr>
+                    <tr><td>4</td><td><input type="number" id="wp_lat_4" class="input" style="width:85%; padding:4px; height:24px;"></td><td><input type="number" id="wp_lon_4" class="input" style="width:85%; padding:4px; height:24px;"></td><td><button class="btn btn-warning" style="height:28px; padding:0; width:45px; margin:0;" onclick="setWp(4)">Set</button></td></tr>
+                    <tr><td>5</td><td><input type="number" id="wp_lat_5" class="input" style="width:85%; padding:4px; height:24px;"></td><td><input type="number" id="wp_lon_5" class="input" style="width:85%; padding:4px; height:24px;"></td><td><button class="btn btn-warning" style="height:28px; padding:0; width:45px; margin:0;" onclick="setWp(5)">Set</button></td></tr>
+                </table>
+
+                <div style="display:flex; justify-content: space-around; margin-bottom: 15px;">
+                   <button id="btn-wp-queda" onclick="toggleWpSafety('queda')" style="background-color: #f0be00; border:none; padding:8px 12px; border-radius:5px; font-weight:bold;">Queda: ON</button>
+                   <button id="btn-wp-colisao" onclick="toggleWpSafety('colisao')" style="background-color: #f0be00; border:none; padding:8px 12px; border-radius:5px; font-weight:bold;">Colisão: ON</button>
+                </div>
+
                 <button type="button" class="btn btn-warning" onclick="sendWaypoint()">Iniciar Waypoint</button>
                 <button type="button" class="btn" onclick="stopWaypoint()" style="background-color: #f44336; color: white;">Parar Waypoint</button>
                 <div id="waypoint_status" style="margin-top: 15px; font-weight: bold; text-align: center; color: #2196F3;">Status: Inativo</div>
@@ -329,6 +317,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     </div>
 
     <div id="tab-setup" class="tab-content">
+        <!-- Setup Mantido igual -->
         <div class="setup-container">
             <div class="setup-box">
                 <span class="setup-title">PID Control</span>
@@ -340,21 +329,14 @@ const char index_html[] PROGMEM = R"rawliteral(
             </div>
             <div class="setup-box">
                 <span class="setup-title">Line Calibration</span>
-                <p style="font-size: 14px; color: gray; margin-top: 0;">Position the robot <b>WITH THE SENSORS OVER THE LINE</b> and start.</p>
                 <button type="button" class="btn btn-warning" onclick="calibrarSensores()">Calibrate Sensors</button>
                 <div id="statusCalibracao" style="margin-top: 10px; font-weight: bold; text-align:center; color: #4CAF50;"></div>
             </div>
             <div class="setup-box">
                 <span class="setup-title">Connect to Wi-Fi</span>
-                <p style="font-size: 14px; color: gray; margin-top: 0;">To access internet and maps.</p>
                 <div class="input-group"><div class="input-group-addon">SSID</div><input type="text" id="wifi_ssid" placeholder="Network name" class="input"></div>
                 <div class="input-group"><div class="input-group-addon">Pass</div><input type="password" id="wifi_pass" placeholder="Network password" class="input"></div>
                 <button type="button" class="btn btn-warning" onclick="send_wifi()">Connect</button>
-                <div id="wifi_ip_container" style="display: none; margin-top: 20px; font-size: 16px; text-align: center; border-top: 1px solid #eee; padding-top: 15px;">
-                    <span style="color: #4CAF50; font-weight: bold;">Connected to your home!</span><br>
-                    <a id="wifi_ip_link" href="#" target="_blank" style="display: inline-block; margin-top: 10px; color: #fff; background-color: #2196F3; padding: 10px 20px; border-radius: 8px; font-weight: bold; text-decoration: none; font-size: 18px;"></a><br>
-                    <button type="button" id="btn-copy-ip" class="btn btn-warning" style="margin-top: 10px;" onclick="copiarIP()">Copy IP</button>
-                </div>
             </div>
         </div>
     </div>
@@ -364,43 +346,55 @@ const char index_html[] PROGMEM = R"rawliteral(
         function safelySend(dataObj) { if (connection && connection.readyState === WebSocket.OPEN) { connection.send(JSON.stringify(dataObj)); } }
         function calibrarSensores() { document.getElementById('statusCalibracao').innerText = "Calibrating..."; document.getElementById('statusCalibracao').style.color = "#f0be00"; safelySend({ cmd: "calibrate_line" }); }
 
-        function usarLocalizacaoAtual() {
-            if (typeof lat !== 'undefined' && lat !== null) {
-                document.getElementById("target_lat").value = lat.toFixed(6);
-                document.getElementById("target_lon").value = lon.toFixed(6);
+        let lat = null, lon = null, lastMapUpdate = 0, map = null, marcador = null;
+        let wp_queda = true, wp_colisao = true;
+
+        function toggleWpSafety(tipo) {
+            if(tipo === 'queda') { wp_queda = !wp_queda; document.getElementById("btn-wp-queda").innerText = "Queda: " + (wp_queda?"ON":"OFF"); document.getElementById("btn-wp-queda").style.backgroundColor = wp_queda?"#f0be00":"#ccc"; }
+            if(tipo === 'colisao') { wp_colisao = !wp_colisao; document.getElementById("btn-wp-colisao").innerText = "Colisão: " + (wp_colisao?"ON":"OFF"); document.getElementById("btn-wp-colisao").style.backgroundColor = wp_colisao?"#f0be00":"#ccc"; }
+            safelySend({wp_queda: wp_queda, wp_colisao: wp_colisao});
+        }
+
+        function setWp(id) {
+            if (lat !== null && lon !== null) {
+                document.getElementById("wp_lat_" + id).value = lat.toFixed(6);
+                document.getElementById("wp_lon_" + id).value = lon.toFixed(6);
             } else {
-                alert("Aguardando sinal válido de GPS do robô para preencher a localização.");
+                alert("Aguardando sinal válido de GPS do robô.");
             }
         }
 
         function sendWaypoint() {
-            var lat_target = parseFloat(document.getElementById("target_lat").value);
-            var lon_target = parseFloat(document.getElementById("target_lon").value);
-            if (!isNaN(lat_target) && !isNaN(lon_target)) {
-                safelySend({ waypoint: true, target_lat: lat_target, target_lon: lon_target });
-                document.getElementById("waypoint_status").innerText = "Status: Navegando para o Alvo...";
+            let list = [];
+            for(let i = 1; i <= 5; i++) {
+                let lt = parseFloat(document.getElementById("wp_lat_" + i).value);
+                let ln = parseFloat(document.getElementById("wp_lon_" + i).value);
+                if(!isNaN(lt) && !isNaN(ln)) { list.push({lat: lt, lon: ln}); }
+            }
+            if(list.length > 0) {
+                safelySend({waypoint: true, list: list, wp_queda: wp_queda, wp_colisao: wp_colisao});
+                document.getElementById("waypoint_status").innerText = "Status: Iniciando rota...";
                 document.getElementById("waypoint_status").style.color = "#4CAF50";
             } else {
-                alert("Insira coordenadas válidas.");
+                alert("Preencha ao menos 1 coordenada válida na tabela.");
             }
         }
 
         function stopWaypoint() {
             safelySend({ waypoint: false });
-            document.getElementById("waypoint_status").innerText = "Status: Parado / Inativo";
+            document.getElementById("waypoint_status").innerText = "Status: Cancelado / Inativo";
             document.getElementById("waypoint_status").style.color = "#f44336";
         }
-
-        let lat = -22.85817, lon = -46.97656, lastMapUpdate = 0, map = null, marcador = null;
 
         function checkAndInitMap() {
             if (typeof L === 'undefined') { document.getElementById('menu-map').style.display = 'none'; showTab('display'); return; }
             if (!map) {
                 try {
+                    let mapLat = (lat !== null) ? lat : -22.85817; let mapLon = (lon !== null) ? lon : -46.97656;
                     document.getElementById('map').style.display = 'block';
-                    map = L.map('map').setView([lat, lon], 15);
+                    map = L.map('map').setView([mapLat, mapLon], 15);
                     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '© OSM' }).addTo(map);
-                    marcador = L.marker([lat, lon]).addTo(map);
+                    marcador = L.marker([mapLat, mapLon]).addTo(map);
                 } catch(e) { document.getElementById('menu-map').style.display = 'none'; showTab('display'); }
             } else if (typeof map.invalidateSize === 'function') { setTimeout(function(){ map.invalidateSize(); }, 100); }
         }
@@ -409,82 +403,26 @@ const char index_html[] PROGMEM = R"rawliteral(
         connection.onopen = function () { console.log('Connection opened'); };
         connection.onmessage = function (e) {
             const data = JSON.parse(e.data);
-            if (data["vbat"]){
-                document.getElementById("vbat").innerText = (data["vbat"] / 1000).toFixed(1);
-                var lbat = (data["vbat"] * 100 / 9000).toFixed(0);
-                if(lbat > 100) lbat = 100; if(lbat < 2) lbat = 2;
-                document.getElementById("lbat").style.width = lbat + '%';
-                document.getElementById("lbat").style.backgroundColor = (lbat < 20) ? "#F00" : (lbat < 70) ? "orange" : "#0F0";
-            }
+            if (data["vbat"]) { document.getElementById("vbat").innerText = (data["vbat"] / 1000).toFixed(1); }
             if (data["distancia"]) document.getElementById("distance").innerText = (data["distancia"]).toFixed(0);
             if (data["robot_speed"] !== undefined) document.getElementById("robot-speed").innerText = data["robot_speed"].toFixed(1);
-            if (data["fall"] !== undefined) {
-                let fallText = document.getElementById("fall-status-text");
-                if (data["fall"]) { fallText.innerText = "Fall Detected"; fallText.style.color = "#FF0000"; } 
-                else { fallText.innerText = ""; }
-            }
-            if (data["stuck"] !== undefined) {
-                let stuckText = document.getElementById("stuck-status-text");
-                if (data["stuck"]) { 
-                    stuckText.innerText = "Caminho Bloqueado!"; 
-                    stuckText.style.color = "#FFA500"; 
-                } 
-                else { 
-                    stuckText.innerText = ""; 
-                }
-            }
+            if (data["fall"] !== undefined) { document.getElementById("fall-status-text").innerText = data["fall"] ? "Fall Detected" : ""; }
             if (data["waypoint_status"]) {
-                document.getElementById("waypoint_status").innerText = "Status: " + data["waypoint_status"];
-                if (data["waypoint_status"] === "alvo_alcancado") {
-                    document.getElementById("waypoint_status").style.color = "#4CAF50";
-                }
+                let textStatus = data["waypoint_status"];
+                document.getElementById("waypoint_status").innerText = "Status: " + textStatus;
+                document.getElementById("waypoint_status").style.color = textStatus.includes("Cancelado") ? "#f44336" : (textStatus.includes("Bloqueado") ? "#FFA500" : "#4CAF50");
             }
             if (data["lat"] !== undefined && data["lat"] !== null) {
                 lat = data["lat"]; lon = data["lon"];
                 document.getElementById("gps-lat").innerText = lat.toFixed(6);
                 document.getElementById("gps-lon").innerText = lon.toFixed(6);
+                document.getElementById("wp-current-loc").innerText = "GPS Atual - Lat: " + lat.toFixed(6) + " | Lon: " + lon.toFixed(6);
                 let agora = Date.now();
                 if (agora - lastMapUpdate >= 3000 && map && marcador) { marcador.setLatLng([lat, lon]); map.setView([lat, lon]); lastMapUpdate = agora; }
             }
             if (data["date"] !== undefined) document.getElementById("gps-date").innerText = data["date"];
             if (data["time"] !== undefined) document.getElementById("gps-time").innerText = data["time"];
-            if (data["ip"]){
-                ip_atual = data["ip"]; document.getElementById("wifi_ip_container").style.display = "block";
-                document.getElementById("wifi_ip_link").innerText = data["ip"]; document.getElementById("wifi_ip_link").href = "http://" + data["ip"];
-            }
-            if (data["status"] === "calibrado") {
-                let infoCor = data["escura"] ? " (Dark Line)" : " (Light Line)";
-                document.getElementById('statusCalibracao').innerText = "Saved! Threshold: " + data["limiar"] + infoCor;
-                document.getElementById('statusCalibracao').style.color = "#4CAF50";
-            }
-            if (data["alert"] === "LOW_BATTERY") { alert("⚠️ SAFETY ALERT: Battery at critical level! Motors disabled."); }
         };
-
-        var ip_atual = "";
-        function copiarIP() {
-            if (!ip_atual) return;
-            navigator.clipboard.writeText(ip_atual).then(() => {
-                var btn = document.getElementById("btn-copy-ip"); let txt = btn.innerText; btn.innerText = "Copied!"; setTimeout(() => btn.innerText = txt, 1500);
-            });
-        }
-
-        function send_wifi() {
-            var ssid = document.getElementById("wifi_ssid").value, pass = document.getElementById("wifi_pass").value;
-            if(ssid !== "") { safelySend({'wifi_ssid': ssid, 'wifi_pass': pass}); alert("Sending request to connect to '" + ssid + "'..."); } 
-            else { alert("Please enter the network name (SSID)."); }
-        }
-
-        function change_pid() {
-            if (document.getElementById("change_pid").innerHTML == "edit") {
-                safelySend({'stop': 1});
-                ["kp", "ki", "kd", "pausa"].forEach(id => { document.getElementById(id).removeAttribute("disabled"); document.getElementById(id).classList.remove("disabled"); });
-                document.getElementById("change_pid").innerHTML = "save";
-            } else {
-                safelySend({'kp': parseFloat(document.getElementById("kp").value), 'ki': parseFloat(document.getElementById("ki").value), 'kd': parseFloat(document.getElementById("kd").value), 'pausa': parseFloat(document.getElementById("pausa").value)});
-                ["kp", "ki", "kd", "pausa"].forEach(id => { document.getElementById(id).setAttribute("disabled", true); document.getElementById(id).classList.add("disabled"); });
-                document.getElementById("change_pid").innerHTML = "edit";
-            }
-        }
 
         function showTab(tab) {
             document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
@@ -500,17 +438,11 @@ const char index_html[] PROGMEM = R"rawliteral(
             led_state[tipo] = !led_state[tipo];
             if (led_state[tipo]) {
                 Object.keys(led_state).forEach(k => {
-                    if(k !== tipo) {
-                        led_state[k] = false;
-                        document.getElementById("btn-led-" + k).classList.remove("on");
-                        document.getElementById("led-status-" + k).innerText = "OFF";
-                    }
+                    if(k !== tipo) { led_state[k] = false; document.getElementById("btn-led-" + k).classList.remove("on"); document.getElementById("led-status-" + k).innerText = "OFF"; }
                 });
             }
-            var btn = document.getElementById("btn-led-" + tipo);
-            var status = document.getElementById("led-status-" + tipo);
-            if(led_state[tipo]){ btn.classList.add("on"); status.innerText = "ON"; } 
-            else { btn.classList.remove("on"); status.innerText = "OFF"; }
+            var btn = document.getElementById("btn-led-" + tipo); var status = document.getElementById("led-status-" + tipo);
+            if(led_state[tipo]){ btn.classList.add("on"); status.innerText = "ON"; } else { btn.classList.remove("on"); status.innerText = "OFF"; }
             safelySend(led_state);
         }
     </script>
@@ -527,22 +459,12 @@ const char index_html[] PROGMEM = R"rawliteral(
             ['mousemove','touchmove'].forEach(evt => canvas_joystick.addEventListener(evt, Draw));
             window.addEventListener('resize', resize);
         }
-        
-        function updateMapVisibility() {
-            var mapTabBtn = document.getElementById('menu-map');
-            if (mapTabBtn) {
-                if (navigator.onLine) { mapTabBtn.style.display = ''; } 
-                else { mapTabBtn.style.display = 'none'; if (document.getElementById('tab-map').classList.contains('active')) showTab('display'); }
-            }
-        }
-        window.addEventListener('online', updateMapVisibility); window.addEventListener('offline', updateMapVisibility);
-        if (document.readyState === 'loading') { document.addEventListener('DOMContentLoaded', () => { initJoystick(); updateMapVisibility(); }); } 
-        else { initJoystick(); updateMapVisibility(); }
+        if (document.readyState === 'loading') { document.addEventListener('DOMContentLoaded', () => { initJoystick(); }); } else { initJoystick(); }
             
         function resize() {
             if (!ctx_joystick) return;
             width = (window.innerWidth > window.innerHeight) ? window.innerHeight : window.innerWidth;
-            radius = width_to_radius_ratio * width; button_size = width_to_size_ratio * width; height = radius * radius_factor * 2 + 100;
+            radius = width_to_radius_ratio * width; height = radius * radius_factor * 2 + 100;
             ctx_joystick.canvas.width = width; ctx_joystick.canvas.height = height;
             origin_joystick.x = width / 2; origin_joystick.y = height / 2; joystick(origin_joystick.x, origin_joystick.y);
         }
@@ -568,11 +490,15 @@ const char index_html[] PROGMEM = R"rawliteral(
         function resetModosAutonomosVisual() {
             led_state.linha = false; led_state.colisao = false; led_state.explora = false;
             ['linha', 'colisao', 'explora'].forEach(k => { document.getElementById("btn-led-" + k).classList.remove("on"); document.getElementById("led-status-" + k).innerText = "OFF"; });
+            // Ao iniciar movimentação pelo JoyStick, cancela qualquer missão ativa para o usuário
+            if(document.getElementById("waypoint_status").innerText.includes("Iniciando") || document.getElementById("waypoint_status").innerText.includes("Navegando")) {
+                document.getElementById("waypoint_status").innerText = "Status: Cancelado pelo Joystick";
+                document.getElementById("waypoint_status").style.color = "#f44336";
+            }
         }
-        function definirBotoesModoAutonomo(habilitado) { ['linha', 'colisao', 'explora'].forEach(k => { if (habilitado) document.getElementById("btn-led-" + k).removeAttribute("disabled"); else document.getElementById("btn-led-" + k).setAttribute("disabled", true); }); }
 
-        function startDrawing(event) { paint = true; document.activeElement.blur(); resetModosAutonomosVisual(); definirBotoesModoAutonomo(false); getPosition_joystick(event); if (in_circle()) { joystick(coord.x, coord.y); Draw(event); } }
-        function stopDrawing() { paint = false; joystick(origin_joystick.x, origin_joystick.y); document.getElementById("speed").innerText = 0; document.getElementById("table-speed").innerText = 0; if (movimento == 1) { safelySend({"velocidade":0, "angulo":0}); movimento = 0; } resetModosAutonomosVisual(); definirBotoesModoAutonomo(true); }
+        function startDrawing(event) { paint = true; document.activeElement.blur(); resetModosAutonomosVisual(); getPosition_joystick(event); if (in_circle()) { joystick(coord.x, coord.y); Draw(event); } }
+        function stopDrawing() { paint = false; joystick(origin_joystick.x, origin_joystick.y); document.getElementById("speed").innerText = 0; document.getElementById("table-speed").innerText = 0; if (movimento == 1) { safelySend({"velocidade":0, "angulo":0}); movimento = 0; } resetModosAutonomosVisual(); }
 
         function Draw(event) {
             if (paint) {
@@ -644,7 +570,7 @@ void setup() {
   SerialGPS.setRxBufferSize(1024);
   SerialGPS.begin(9600, SERIAL_8N1, PINO_GPS_RX, PINO_GPS_TX);
   
-  Serial.println("RoboCore - Kit Robo Explorer - Waypoints GPS");
+  Serial.println("RoboCore - Kit Robo Explorer - Waypoints GPS Multi");
 
   pinMode(PINO_LED, OUTPUT);
   digitalWrite(PINO_LED, LOW);
@@ -702,18 +628,15 @@ void loop() {
   while (SerialGPS.available() > 0) { gps.encode(SerialGPS.read()); }
   atualizar_sensor_ultrassonico();
 
-  // Executa a malha de odometria e fusão a 20Hz (a cada 50ms)
   static unsigned long tempo_odo_fusao = 0;
   if (millis() - tempo_odo_fusao > 50) {
       atualizar_odometria_fusao();
       tempo_odo_fusao = millis();
   }
 
-  // 1. Monitoramento da Segurança da Bateria
   static uint32_t ultimoCheckBateria = 0;
   if (millis() - ultimoCheckBateria > 2000) { ultimoCheckBateria = millis(); verificarSegurancaBateria(); }
 
-  // 2. Cálculo de RPM e Velocidade em cm/s via Encoder
   static unsigned long last_contador_esq_A = 0;
   static unsigned long last_contador_esq_B = 0;
   static unsigned long last_contador_dir_A = 0;
@@ -734,13 +657,9 @@ void loop() {
     robot_speed_cms = (media_rpm * 20.4) / 60.0;
 
     if (ws.count() > 0) {
-      JsonDocument json;
-      json["robot_speed"] = robot_speed_cms;
-      size_t msg_comp = measureJson(json); 
-      char msg[msg_comp + 1];
-      serializeJson(json, msg, msg_comp + 1); 
-      msg[msg_comp] = 0; 
-      ws.textAll(msg, msg_comp);
+      JsonDocument json; json["robot_speed"] = robot_speed_cms;
+      size_t msg_comp = measureJson(json); char msg[msg_comp + 1];
+      serializeJson(json, msg, msg_comp + 1); msg[msg_comp] = 0; ws.textAll(msg, msg_comp);
     }
 
     last_contador_esq_A = contador_esq_A;
@@ -750,7 +669,6 @@ void loop() {
     tempo_antes_encoder = millis();
   }
 
-  // 3. Executa os modos autônomos
   if (modoSegurancaBateria) {
       modo_linha = false; modo_colisao = false; modo_explora = false; modo_waypoints = false;
       parar_motores();
@@ -761,31 +679,6 @@ void loop() {
       else if (modo_waypoints) navega_waypoints();
   }
 
-  // 4. Processa a troca de Wi-Fi
-  if (change_wifi_flag) {
-    change_wifi_flag = false;
-    WiFi.mode(WIFI_AP_STA);
-    WiFi.begin(new_wifi_ssid.c_str(), new_wifi_pass.c_str());
-    uint32_t timeout_conexao = millis() + 15000; 
-    bool conectado = false;
-    while (millis() < timeout_conexao) {
-      if (WiFi.status() == WL_CONNECTED) { conectado = true; break; }
-      delay(500);
-    }
-    if (conectado) {
-      String ipDaCasa = WiFi.localIP().toString();
-      if (ws.count() > 0) {
-        JsonDocument jsonIp; jsonIp[ALIAS_IP] = ipDaCasa;
-        size_t msg_comp = measureJson(jsonIp); char msg[msg_comp + 1];
-        serializeJson(jsonIp, msg, (msg_comp + 1)); msg[msg_comp] = 0;
-        ws.textAll(msg, msg_comp);
-      }
-    } else {
-      WiFi.mode(WIFI_AP); 
-    }
-  }
-
-  // 5. VBAT
   if (millis() > timeout_vbat) {
     if (ws.count() > 0) {
       uint32_t tensao = vbat.readVoltage();
@@ -796,7 +689,6 @@ void loop() {
     timeout_vbat = millis() + TEMPO_ATUALIZACAO_VBAT;
   }
   
-  // 6. Dados de GPS e Localização
   if (millis() > timeout_gps) {
     if (ws.count() > 0) {
         float flat, flon; unsigned long age;
@@ -825,92 +717,61 @@ void loop() {
             json["lat"] = odometria_inicializada ? estimativa_lat : flat; 
             json["lon"] = odometria_inicializada ? estimativa_lon : flon; 
         }
-        
-        json["date"] = date_str; 
-        json["time"] = time_str;
+        json["date"] = date_str; json["time"] = time_str;
         
         size_t msg_comp = measureJson(json); char msg[msg_comp + 1];
         serializeJson(json, msg, (msg_comp + 1)); msg[msg_comp] = 0; ws.textAll(msg, msg_comp);
     }
     timeout_gps = millis() + 1000;
   }
-  
   delay(1); 
 }
 
 // --------------------------------------------------
-// LÓGICA DE FUSÃO SENSORIAL COM CALIBRAÇÃO GEOMÉTRICA BLINDADA
-
 void atualizar_odometria_fusao() {
-    // 1. ODOMETRIA COM ENCODERS
     long pulsos_esq_atual = contador_esq_A;
     long pulsos_dir_atual = contador_dir_A;
     
     long delta_esq = (long)(pulsos_esq_atual - odo_esq_anterior) * sinal_esq;
     long delta_dir = (long)(pulsos_dir_atual - odo_dir_anterior) * sinal_dir;
     
-    odo_esq_anterior = pulsos_esq_atual;
-    odo_dir_anterior = pulsos_dir_atual;
+    odo_esq_anterior = pulsos_esq_atual; odo_dir_anterior = pulsos_dir_atual;
     
-    float dist_esq = delta_esq * CM_POR_PULSO;
-    float dist_dir = delta_dir * CM_POR_PULSO;
+    float dist_esq = delta_esq * CM_POR_PULSO; float dist_dir = delta_dir * CM_POR_PULSO;
     float dist_centro = (dist_esq + dist_dir) / 2.0;
     
     float delta_theta = (dist_esq - dist_dir) / LARGURA_ESTEIRA_EFETIVA;
     theta_rad += delta_theta;
     
-    while (theta_rad >= TWO_PI) theta_rad -= TWO_PI;
-    while (theta_rad < 0) theta_rad += TWO_PI;
+    while (theta_rad >= TWO_PI) theta_rad -= TWO_PI; while (theta_rad < 0) theta_rad += TWO_PI;
     
-    float delta_x_cm = dist_centro * cos(theta_rad); 
-    float delta_y_cm = dist_centro * sin(theta_rad); 
-    
-    float delta_lat = delta_x_cm / 11132000.0; 
-    float delta_lon = 0.0;
+    float delta_x_cm = dist_centro * cos(theta_rad); float delta_y_cm = dist_centro * sin(theta_rad); 
+    float delta_lat = delta_x_cm / 11132000.0; float delta_lon = 0.0;
     
     if (odometria_inicializada) {
         delta_lon = delta_y_cm / (11132000.0 * cos(estimativa_lat * PI / 180.0));
-        estimativa_lat += delta_lat;
-        estimativa_lon += delta_lon;
+        estimativa_lat += delta_lat; estimativa_lon += delta_lon;
     }
 
-    // 2. FUSÃO SENSORIAL E CALIBRAÇÃO GEOMÉTRICA BLINDADA
-    float flat, flon;
-    unsigned long age;
+    float flat, flon; unsigned long age;
     gps.f_get_position(&flat, &flon, &age);
     static float ultimo_flat_processado = 0.0;
     
     if (flat != TinyGPS::GPS_INVALID_F_ANGLE && age < 1500) {
         if (!odometria_inicializada) {
-            estimativa_lat = flat;
-            estimativa_lon = flon;
-            ultimo_flat_processado = flat;
-            odometria_inicializada = true;
-            heading_gps_valido = false; 
-            registrou_inicio_calibracao = false;
+            estimativa_lat = flat; estimativa_lon = flon; ultimo_flat_processado = flat;
+            odometria_inicializada = true; heading_gps_valido = false; registrou_inicio_calibracao = false;
         } else {
             if (flat != ultimo_flat_processado) {
-                // Continua corrigindo o X e Y do robô em tempo real
-                estimativa_lat = (estimativa_lat * 0.85) + (flat * 0.15);
-                estimativa_lon = (estimativa_lon * 0.85) + (flon * 0.15);
-                ultimo_flat_processado = flat;
-                
-                // --- CALIBRAÇÃO GEOMÉTRICA SEGURA ---
+                estimativa_lat = (estimativa_lat * 0.85) + (flat * 0.15); estimativa_lon = (estimativa_lon * 0.85) + (flon * 0.15); ultimo_flat_processado = flat;
                 if (!heading_gps_valido && modo_waypoints) {
                     if (!registrou_inicio_calibracao) {
-                        lat_inicio_calibracao = flat;
-                        lon_inicio_calibracao = flon;
-                        pulsos_inicio_calibracao = contador_esq_A; // Salva o marco mecânico
-                        registrou_inicio_calibracao = true;
+                        lat_inicio_calibracao = flat; lon_inicio_calibracao = flon; pulsos_inicio_calibracao = contador_esq_A; registrou_inicio_calibracao = true;
                     } else {
-                        // O robô agora usa AS ESTEIRAS como régua, não o GPS!
                         float dist_fisica_cm = (contador_esq_A - pulsos_inicio_calibracao) * CM_POR_PULSO;
-                        
-                        // Exige 2.5 metros FÍSICOS para ignorar qualquer ruído do satélite
                         if (dist_fisica_cm >= 250.0) {
                             float curso_calculado = TinyGPS::course_to(lat_inicio_calibracao, lon_inicio_calibracao, flat, flon);
-                            theta_rad = curso_calculado * PI / 180.0;
-                            heading_gps_valido = true; 
+                            theta_rad = curso_calculado * PI / 180.0; heading_gps_valido = true; 
                         }
                     }
                 }
@@ -921,16 +782,12 @@ void atualizar_odometria_fusao() {
 
 // --------------------------------------------------
 void configurar_servidor_web(void) {
-  ws.onEvent(onEvent);
-  server.addHandler(&ws);
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send_P(200, "text/html", index_html);
-  });
+  ws.onEvent(onEvent); server.addHandler(&ws);
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) { request->send_P(200, "text/html", index_html); });
 }
 
 void controlar_motor(uint8_t *data, size_t length){
-  JsonDocument json;
-  deserializeJson(json, data, length);
+  JsonDocument json; deserializeJson(json, data, length);
   int16_t angulo = json[ALIAS_ANGULO], velocidade = json[ALIAS_VELOCIDADE];
 
   if (velocidade == 0) parar_motores();
@@ -946,72 +803,53 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t length) {
   if (info->final && info->index == 0 && info->len == length && info->opcode == WS_TEXT) {
     data[length] = 0;
 
-    if (strstr(reinterpret_cast<char *>(data), ALIAS_WIFI_SSID) != nullptr) {
-      JsonDocument json; deserializeJson(json, data, length);
-      new_wifi_ssid = json[ALIAS_WIFI_SSID].as<String>();
-      new_wifi_pass = json[ALIAS_WIFI_PASS].as<String>();
-      change_wifi_flag = true;
+    if (strstr(reinterpret_cast<char *>(data), "wp_queda") != nullptr) {
+        JsonDocument json; deserializeJson(json, data, length);
+        if(json.containsKey("wp_queda")) wp_evita_queda = json["wp_queda"].as<bool>();
+        if(json.containsKey("wp_colisao")) wp_evita_colisao = json["wp_colisao"].as<bool>();
     }
     else if (strstr(reinterpret_cast<char *>(data), ALIAS_WAYPOINT) != nullptr) {
       JsonDocument json; deserializeJson(json, data, length);
       modo_waypoints = json[ALIAS_WAYPOINT].as<bool>();
       if (modo_waypoints) {
           modo_linha = false; modo_colisao = false; modo_explora = false;
-          estadoWay = WAY_LIVRE;
-          heading_gps_valido = false; 
-          registrou_inicio_calibracao = false; // NOVA ÂNCORA
-          target_lat = json["target_lat"].as<float>();
-          target_lon = json["target_lon"].as<float>();
+          estadoWay = WAY_LIVRE; heading_gps_valido = false; registrou_inicio_calibracao = false;
+          total_waypoints = 0; waypoint_atual_idx = 0;
+          
+          JsonArray list = json["list"].as<JsonArray>();
+          for(JsonVariant v : list) {
+              if (total_waypoints < 5) {
+                  waypoints_lat[total_waypoints] = v["lat"].as<float>();
+                  waypoints_lon[total_waypoints] = v["lon"].as<float>();
+                  total_waypoints++;
+              }
+          }
       } else {
-          parar_motores();
+          parar_motores(); total_waypoints = 0;
       }
     }
     else if (strstr(reinterpret_cast<char *>(data), ALIAS_LINHA) != nullptr || strstr(reinterpret_cast<char *>(data), ALIAS_COLISAO) != nullptr || strstr(reinterpret_cast<char *>(data), ALIAS_EXPLORA) != nullptr) {
       JsonDocument json; deserializeJson(json, data, length);
-      
       if (json.containsKey(ALIAS_LINHA)) modo_linha = json[ALIAS_LINHA].as<bool>();
       if (json.containsKey(ALIAS_COLISAO)) modo_colisao = json[ALIAS_COLISAO].as<bool>();
       if (json.containsKey(ALIAS_EXPLORA)) modo_explora = json[ALIAS_EXPLORA].as<bool>();
       
-      if (modo_linha) { 
-          modo_colisao = false; modo_explora = false; modo_waypoints = false;
-          erro = 0.0; I = 0.0; erro_anterior = 0.0; contador_parada = 0; 
-      }
+      if (modo_linha) { modo_colisao = false; modo_explora = false; modo_waypoints = false; erro = 0.0; I = 0.0; erro_anterior = 0.0; contador_parada = 0; }
       else if (modo_colisao) { modo_linha = false; modo_explora = false; modo_waypoints = false; }
       else if (modo_explora) { modo_linha = false; modo_colisao = false; modo_waypoints = false; }
 
       if (!modo_linha && !modo_colisao && !modo_explora && !modo_waypoints) {
-        parar_motores();
-        estadoManobraAtual = LIVRE;
-        estadoExplora = EXPLORA_LIVRE;
-        ws.textAll("{\"fall\":false, \"stuck\":false}"); 
+        parar_motores(); estadoManobraAtual = LIVRE; estadoExplora = EXPLORA_LIVRE; ws.textAll("{\"fall\":false, \"stuck\":false}"); 
       }
     }
-    else if (strstr(reinterpret_cast<char *>(data), ALIAS_KP) != nullptr) {
-      JsonDocument json; deserializeJson(json, data, length);
-      parada = false; Kp = json[ALIAS_KP]; Ki = json[ALIAS_KI]; Kd = json[ALIAS_KD];
-      SPIFFS.begin(DIRETORIO_SPIFFS, false);
-      SPIFFS.putFloat(ENDERECOS_SPIFFS[0], espera); SPIFFS.putFloat(ENDERECOS_SPIFFS[1], Kp);
-      SPIFFS.putFloat(ENDERECOS_SPIFFS[2], Ki); SPIFFS.putFloat(ENDERECOS_SPIFFS[3], Kd);
-      SPIFFS.end();
-    } 
     else if (strstr(reinterpret_cast<char *>(data), ALIAS_VELOCIDADE) != nullptr) {
       if (modo_linha || modo_colisao || modo_explora || modo_waypoints) {
-        modo_linha = false; modo_colisao = false; modo_explora = false; modo_waypoints = false;
+        modo_linha = false; modo_colisao = false; modo_explora = false; modo_waypoints = false; total_waypoints = 0;
         parar_motores(); estadoManobraAtual = LIVRE; estadoExplora = EXPLORA_LIVRE;
-        ws.textAll("{\"fall\":false, \"stuck\":false}"); 
+        ws.textAll("{\"fall\":false, \"stuck\":false, \"waypoint_status\":\"Cancelado pelo Joystick\"}"); 
       }
       controlar_motor(data, length);
     } 
-    else if (strstr(reinterpret_cast<char *>(data), ALIAS_PARA) != nullptr) {
-      modo_linha = false; modo_colisao = false; modo_explora = false; modo_waypoints = false;
-      parar_motores(); estadoManobraAtual = LIVRE; estadoExplora = EXPLORA_LIVRE;
-      ws.textAll("{\"fall\":false, \"stuck\":false}"); 
-    }
-    else if (strstr(reinterpret_cast<char *>(data), "cmd") != nullptr) {
-      JsonDocument json; deserializeJson(json, data, length);
-      if (json["cmd"].as<String>() == "calibrate_line") calibrarSensoresLinha();
-    }
   }
 }
 
@@ -1019,21 +857,12 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t length) {
 int16_t ler_distancia(void) {
   int16_t leituras[3];
   for (int i = 0; i < 3; i++) {
-    digitalWrite(PINO_HCSR04_TRIGGER, HIGH); 
-    delayMicroseconds(10); 
-    digitalWrite(PINO_HCSR04_TRIGGER, LOW);
-    unsigned long duracao = pulseIn(PINO_HCSR04_ECHO, HIGH, 25000);
-    leituras[i] = (duracao == 0) ? -1 : (duracao / 58);
-    delay(5);
+    digitalWrite(PINO_HCSR04_TRIGGER, HIGH); delayMicroseconds(10); digitalWrite(PINO_HCSR04_TRIGGER, LOW);
+    unsigned long duracao = pulseIn(PINO_HCSR04_ECHO, HIGH, 25000); leituras[i] = (duracao == 0) ? -1 : (duracao / 58); delay(5);
   }
-  
   for (int i = 0; i < 2; i++) {
     for (int j = i + 1; j < 3; j++) {
-      if (leituras[j] < leituras[i]) {
-        int16_t temp = leituras[i];
-        leituras[i] = leituras[j];
-        leituras[j] = temp;
-      }
+      if (leituras[j] < leituras[i]) { int16_t temp = leituras[i]; leituras[i] = leituras[j]; leituras[j] = temp; }
     }
   }
   return leituras[1]; 
@@ -1042,14 +871,11 @@ int16_t ler_distancia(void) {
 void atualizar_sensor_ultrassonico(void) {
   if (millis() > timeout_distancia) {
     int16_t leitura = ler_distancia();
-    if (leitura > 0 && leitura < 400) {
-      distancia = (leitura * 0.2) + (distancia * 0.8); 
-    }
+    if (leitura > 0 && leitura < 400) { distancia = (leitura * 0.2) + (distancia * 0.8); }
     if (millis() > timeout_distancia_ws) {
         if (ws.count() > 0) {
           JsonDocument json; json[ALIAS_DISTANCIA] = (int)distancia;
-          size_t msg_comp = measureJson(json); char msg[msg_comp + 1];
-          serializeJson(json, msg, (msg_comp + 1)); msg[msg_comp] = 0; ws.textAll(msg, msg_comp);
+          size_t msg_comp = measureJson(json); char msg[msg_comp + 1]; serializeJson(json, msg, (msg_comp + 1)); msg[msg_comp] = 0; ws.textAll(msg, msg_comp);
         }
         timeout_distancia_ws = millis() + 250; 
     }
@@ -1059,70 +885,29 @@ void atualizar_sensor_ultrassonico(void) {
 
 // --------------------------------------------------
 void segue_linha() {
-  leitura_esquerdo = analogRead(SENSOR_LINHA_ESQUERDO);
-  leitura_direito = analogRead(SENSOR_LINHA_DIREITO);
+  leitura_esquerdo = analogRead(SENSOR_LINHA_ESQUERDO); leitura_direito = analogRead(SENSOR_LINHA_DIREITO);
+  bool ve_esq = (leitura_esquerdo > limiarLinha); bool ve_dir = (leitura_direito > limiarLinha);
 
-  bool ve_esq = (leitura_esquerdo > limiarLinha);
-  bool ve_dir = (leitura_direito > limiarLinha);
+   if(ve_esq && ve_dir) { erro = 0.0; calcula_PID(); mover_motores(velocidade_esquerda, velocidade_direita); contador_parada = 0; }
+  else if(!ve_esq && !ve_dir){ if (erro == 1.0) { erro = 2.0; } else if (erro < 0.0) { erro = -2.0; } calcula_PID(); mover_motores(velocidade_esquerda, velocidade_direita); }
+  else if(ve_dir) { erro = 1.0; calcula_PID(); mover_motores(velocidade_esquerda, velocidade_direita); contador_parada = 0; }
+  else if(ve_esq) { erro = -1.0; calcula_PID(); mover_motores(velocidade_esquerda, velocidade_direita); contador_parada = 0; }
 
-   if(ve_esq && ve_dir) {
-      erro = 0.0; 
-      calcula_PID(); 
-      mover_motores(velocidade_esquerda, velocidade_direita); 
-      contador_parada = 0; 
-  }
-  else if(!ve_esq && !ve_dir){
-      if (erro == 1.0) { erro = 2.0; } 
-      else if (erro < 0.0) { erro = -2.0; }
-      calcula_PID(); 
-      mover_motores(velocidade_esquerda, velocidade_direita); 
-  }
-  else if(ve_dir) {
-      erro = 1.0; 
-      calcula_PID(); 
-      mover_motores(velocidade_esquerda, velocidade_direita); 
-      contador_parada = 0; 
-  }
-  else if(ve_esq) {
-      erro = -1.0; 
-      calcula_PID(); 
-      mover_motores(velocidade_esquerda, velocidade_direita); 
-      contador_parada = 0; 
-  }
-
-  if (contador_parada >= CONTAGEM_MAXIMA) { 
-     parar_motores(); P = 0; I = 0; D = 0; 
-     contador_parada = CONTAGEM_MAXIMA;
-  }
+  if (contador_parada >= CONTAGEM_MAXIMA) { parar_motores(); P = 0; I = 0; D = 0; contador_parada = CONTAGEM_MAXIMA; }
   delay(espera);
 }
 
-// --------------------------------------------------
 void evita_colisao() {
   if (estadoManobraAtual != LIVRE) {
     bool transicao = false;
-
-    if ((contador_esq_A - posicao_inicial_manobra) >= alvoPulsosManobra) {
-        transicao = true;
-    }
-
+    if ((contador_esq_A - posicao_inicial_manobra) >= alvoPulsosManobra) { transicao = true; }
     if (!transicao) { return; } 
     else {
         if (estadoManobraAtual == MANOBRA_QUEDA_RE || estadoManobraAtual == MANOBRA_PAREDE_RE) {
-            parar_motores();
-            delay(250); 
-            mover_motores(VELOCIDADE_GIRO, -VELOCIDADE_GIRO); 
+            parar_motores(); delay(250); mover_motores(VELOCIDADE_GIRO, -VELOCIDADE_GIRO); 
             estadoManobraAtual = (estadoManobraAtual == MANOBRA_QUEDA_RE) ? MANOBRA_QUEDA_GIRO : MANOBRA_PAREDE_GIRO;
-            posicao_inicial_manobra = contador_esq_A;
-            alvoPulsosManobra = PULSOS_180_GRAUS;
-            return;
-        } else {
-            parar_motores();
-            delay(100);
-            estadoManobraAtual = LIVRE;
-            if (ws.count() > 0) ws.textAll("{\"fall\":false}");
-            return;
-        }
+            posicao_inicial_manobra = contador_esq_A; alvoPulsosManobra = PULSOS_180_GRAUS; return;
+        } else { parar_motores(); delay(100); estadoManobraAtual = LIVRE; if (ws.count() > 0) ws.textAll("{\"fall\":false}"); return; }
     }
   }
 
@@ -1135,83 +920,47 @@ void evita_colisao() {
 
   if (queda_detectada || obstaculo_frente) {
       if (queda_detectada && !status_queda_ui) { if (ws.count() > 0) ws.textAll("{\"fall\":true}"); status_queda_ui = true; }
-      parar_motores();
-      delay(250); 
-      mover_motores(-VELOCIDADE, -VELOCIDADE); 
+      parar_motores(); delay(250); mover_motores(-VELOCIDADE, -VELOCIDADE); 
       estadoManobraAtual = queda_detectada ? MANOBRA_QUEDA_RE : MANOBRA_PAREDE_RE;
-      
-      posicao_inicial_manobra = contador_esq_A;
-      alvoPulsosManobra = queda_detectada ? PULSOS_30_CM : PULSOS_15_CM; 
+      posicao_inicial_manobra = contador_esq_A; alvoPulsosManobra = queda_detectada ? PULSOS_30_CM : PULSOS_15_CM; 
       timeout_distancia = millis() + TEMPO_ATUALIZACAO_DISTANCIA;
-  } else {
-    mover_motores(VELOCIDADE, VELOCIDADE);
-  }
+  } else { mover_motores(VELOCIDADE, VELOCIDADE); }
 }
 
-// --------------------------------------------------
 void explora_casa() {
   bool obstaculo_frente = (distancia > 0) && (distancia <= DISTANCIA_EXPLORACAO);
   bool queda_detectada = (analogRead(SENSOR_LINHA_ESQUERDO) > LIMIAR_QUEDA) || (analogRead(SENSOR_LINHA_DIREITO) > LIMIAR_QUEDA);
-  
   static bool status_queda_ui_explora = false;
 
-  if (estadoExplora == EXPLORA_PARADO) {
-      parar_motores();
-      return; 
-  }
+  if (estadoExplora == EXPLORA_PARADO) { parar_motores(); return; }
 
   if (estadoExplora != EXPLORA_LIVRE) {
       if (millis() - tempo_inicio_manobra_explora > TIMEOUT_MAX_EXPLORA) {
-          estadoExplora = EXPLORA_LIVRE;
-          giros_consecutivos = 0;
-          mover_motores(VELOCIDADE_EXPLORACAO, VELOCIDADE_EXPLORACAO);
-          return;
+          estadoExplora = EXPLORA_LIVRE; giros_consecutivos = 0; mover_motores(VELOCIDADE_EXPLORACAO, VELOCIDADE_EXPLORACAO); return;
       }
-
       if (estadoExplora == EXPLORA_RE) {
           if ((contador_esq_A - posicao_inicial_explora) >= alvoPulsosExplora) {
-              parar_motores();
-              delay(250); 
-              
-              mover_motores(VELOCIDADE_GIRO, -VELOCIDADE_GIRO); 
-              estadoExplora = EXPLORA_GIRO;
-              posicao_inicial_explora = contador_esq_A;
-              alvoPulsosExplora = PULSOS_45_GRAUS;
-              tempo_inicio_manobra_explora = millis(); 
+              parar_motores(); delay(250); mover_motores(VELOCIDADE_GIRO, -VELOCIDADE_GIRO); 
+              estadoExplora = EXPLORA_GIRO; posicao_inicial_explora = contador_esq_A; alvoPulsosExplora = PULSOS_45_GRAUS; tempo_inicio_manobra_explora = millis(); 
           }
       } 
       else if (estadoExplora == EXPLORA_GIRO) {
           if ((contador_esq_A - posicao_inicial_explora) >= alvoPulsosExplora) {
-              parar_motores();
-              delay(100);
-              
-              giros_consecutivos++;
+              parar_motores(); delay(100); giros_consecutivos++;
 
               bool ainda_obstaculo = ((distancia > 0) && (distancia <= DISTANCIA_EXPLORACAO));
               bool ainda_queda = (analogRead(SENSOR_LINHA_ESQUERDO) > LIMIAR_QUEDA) || (analogRead(SENSOR_LINHA_DIREITO) > LIMIAR_QUEDA);
 
               if (ainda_obstaculo || ainda_queda) {
                   if (giros_consecutivos >= 8) {
-                      estadoExplora = EXPLORA_PARADO;
-                      if (ws.count() > 0) ws.textAll("{\"stuck\":true}"); 
+                      estadoExplora = EXPLORA_PARADO; if (ws.count() > 0) ws.textAll("{\"stuck\":true}"); 
                   } else {
-                      mover_motores(VELOCIDADE_GIRO, -VELOCIDADE_GIRO); 
-                      posicao_inicial_explora = contador_esq_A;
-                      alvoPulsosExplora = PULSOS_45_GRAUS;
-                      tempo_inicio_manobra_explora = millis();
-                      
-                      if (ainda_queda && !status_queda_ui_explora) {
-                          if (ws.count() > 0) ws.textAll("{\"fall\":true}"); 
-                          status_queda_ui_explora = true;
-                      }
+                      mover_motores(VELOCIDADE_GIRO, -VELOCIDADE_GIRO); posicao_inicial_explora = contador_esq_A; alvoPulsosExplora = PULSOS_45_GRAUS; tempo_inicio_manobra_explora = millis();
+                      if (ainda_queda && !status_queda_ui_explora) { if (ws.count() > 0) ws.textAll("{\"fall\":true}"); status_queda_ui_explora = true; }
                   }
               } else {
-                  estadoExplora = EXPLORA_LIVRE;
-                  giros_consecutivos = 0;
-                  if (status_queda_ui_explora) {
-                      if (ws.count() > 0) ws.textAll("{\"fall\":false}");
-                      status_queda_ui_explora = false;
-                  }
+                  estadoExplora = EXPLORA_LIVRE; giros_consecutivos = 0;
+                  if (status_queda_ui_explora) { if (ws.count() > 0) ws.textAll("{\"fall\":false}"); status_queda_ui_explora = false; }
                   mover_motores(VELOCIDADE_EXPLORACAO, VELOCIDADE_EXPLORACAO);
               }
           }
@@ -1220,48 +969,39 @@ void explora_casa() {
   }
 
   if (queda_detectada || obstaculo_frente) {
-      if (queda_detectada && !status_queda_ui_explora) { 
-          if (ws.count() > 0) ws.textAll("{\"fall\":true}"); 
-          status_queda_ui_explora = true; 
-      }
-      parar_motores();
-      delay(250); 
-      
-      mover_motores(-VELOCIDADE_EXPLORACAO, -VELOCIDADE_EXPLORACAO);
-      estadoExplora = EXPLORA_RE;
-      giros_consecutivos = 0;
-      posicao_inicial_explora = contador_esq_A;
-      alvoPulsosExplora = PULSOS_20_CM;
-      tempo_inicio_manobra_explora = millis();
+      if (queda_detectada && !status_queda_ui_explora) { if (ws.count() > 0) ws.textAll("{\"fall\":true}"); status_queda_ui_explora = true; }
+      parar_motores(); delay(250); mover_motores(-VELOCIDADE_EXPLORACAO, -VELOCIDADE_EXPLORACAO);
+      estadoExplora = EXPLORA_RE; giros_consecutivos = 0; posicao_inicial_explora = contador_esq_A; alvoPulsosExplora = PULSOS_20_CM; tempo_inicio_manobra_explora = millis();
   } else {
-      if (status_queda_ui_explora) {
-          if (ws.count() > 0) ws.textAll("{\"fall\":false}");
-          status_queda_ui_explora = false;
-      }
+      if (status_queda_ui_explora) { if (ws.count() > 0) ws.textAll("{\"fall\":false}"); status_queda_ui_explora = false; }
       mover_motores(VELOCIDADE_EXPLORACAO, VELOCIDADE_EXPLORACAO);
   }
 }
 
 // --------------------------------------------------
-// --------------------------------------------------
 void navega_waypoints() {
-  if (!odometria_inicializada) {
+  if (!odometria_inicializada || total_waypoints == 0 || waypoint_atual_idx >= total_waypoints) {
       parar_motores();
+      modo_waypoints = false;
       return; 
   }
 
-  bool obstaculo_frente = false; 
-  bool queda_detectada = false; 
+  float target_lat = waypoints_lat[waypoint_atual_idx];
+  float target_lon = waypoints_lon[waypoint_atual_idx];
 
-  // FASE 1: CALIBRAÇÃO DA BÚSSOLA GEOMÉTRICA (Usa a régua dos encoders)
+  bool obstaculo_frente = wp_evita_colisao && (distancia > 0) && (distancia <= DISTANCIA_OBSTACULO);
+  bool queda_detectada = wp_evita_queda && ((analogRead(SENSOR_LINHA_ESQUERDO) > LIMIAR_QUEDA) || (analogRead(SENSOR_LINHA_DIREITO) > LIMIAR_QUEDA));
+
+  if (obstaculo_frente || queda_detectada) {
+      parar_motores();
+      if (ws.count() > 0) ws.textAll("{\"waypoint_status\":\"Bloqueado (Queda/Obstáculo)!\"}");
+      return;
+  }
+
+  // FASE 1: CALIBRAÇÃO DA BÚSSOLA GEOMÉTRICA
   if (!heading_gps_valido) {
-      if (obstaculo_frente || queda_detectada) {
-          parar_motores(); 
-          if (ws.count() > 0) ws.textAll("{\"waypoint_status\":\"Bloqueado na Calibracao!\"}");
-      } else {
-          mover_motores(VELOCIDADE_EXPLORACAO, VELOCIDADE_EXPLORACAO);
-          if (ws.count() > 0) ws.textAll("{\"waypoint_status\":\"Calibrando Direcao...\"}");
-      }
+      mover_motores(VELOCIDADE_EXPLORACAO, VELOCIDADE_EXPLORACAO);
+      if (ws.count() > 0) ws.textAll("{\"waypoint_status\":\"Calibrando Direcao...\"}");
       return; 
   }
 
@@ -1269,33 +1009,55 @@ void navega_waypoints() {
   float distancia_alvo = TinyGPS::distance_between(estimativa_lat, estimativa_lon, target_lat, target_lon);
   if (distancia_alvo < 1.0) {
       parar_motores();
-      modo_waypoints = false;
-      estadoWay = WAY_LIVRE;
-      heading_gps_valido = false; 
-      if (ws.count() > 0) ws.textAll("{\"waypoint_status\":\"alvo_alcancado\"}");
+      waypoint_atual_idx++;
+      if (waypoint_atual_idx >= total_waypoints) {
+          modo_waypoints = false;
+          estadoWay = WAY_LIVRE;
+          heading_gps_valido = false; 
+          total_waypoints = 0;
+          if (ws.count() > 0) ws.textAll("{\"waypoint_status\":\"Destino Final Alcancado!\"}");
+      } else {
+          if (ws.count() > 0) {
+              char msgStatus[64];
+              sprintf(msgStatus, "{\"waypoint_status\":\"Ponto %d/%d alcancado. Indo para o prox...\"}", waypoint_atual_idx, total_waypoints);
+              ws.textAll(msgStatus);
+          }
+          delay(1000); 
+      }
       return;
   }
 
-  // FASE 3: NAVEGAÇÃO RETA CORRIGIDA POR GPS
+  if (ws.count() > 0) {
+      char msgStatus[64];
+      sprintf(msgStatus, "{\"waypoint_status\":\"Navegando para o Ponto %d/%d\"}", waypoint_atual_idx + 1, total_waypoints);
+      ws.textAll(msgStatus);
+  }
+
+  // FASE 3: NAVEGAÇÃO RETA CORRIGIDA POR GPS E FILTRO ANTI-STALL
   float curso_alvo = TinyGPS::course_to(estimativa_lat, estimativa_lon, target_lat, target_lon);
   
-  // Atualiza o curso atual diretamente com o vetor real do GPS em movimento
-  float flat, flon;
-  unsigned long age;
+  float flat, flon; unsigned long age;
   gps.f_get_position(&flat, &flon, &age);
-  static float ant_lat = 0, ant_lon = 0;
   
-  if (flat != TinyGPS::GPS_INVALID_F_ANGLE && (flat != ant_lat || flon != ant_lon)) {
-      float curso_gps_real = TinyGPS::course_to(ant_lat, ant_lon, flat, flon);
-      if (curso_gps_real >= 0) {
-          // Mistura o curso das esteiras com o curso real do GPS para evitar círculos
-          float erro_mix = curso_gps_real - (theta_rad * 180.0 / PI);
-          while(erro_mix > 180) erro_mix -= 360;
-          while(erro_mix < -180) erro_mix += 360;
-          theta_rad += (erro_mix * 0.3) * PI / 180.0; // Correção suave
+  static float ant_lat = 0.0, ant_lon = 0.0;
+  static int estado_motor_anterior = 0; 
+
+  if (flat != TinyGPS::GPS_INVALID_F_ANGLE) {
+      if (ant_lat == 0.0 && ant_lon == 0.0) {
+          ant_lat = flat; ant_lon = flon;
+      } else if (flat != ant_lat || flon != ant_lon) {
+          float dist_movida = TinyGPS::distance_between(ant_lat, ant_lon, flat, flon);
+          if (dist_movida >= 1.0) {
+              float curso_gps_real = TinyGPS::course_to(ant_lat, ant_lon, flat, flon);
+              if (curso_gps_real >= 0) {
+                  float erro_mix = curso_gps_real - (theta_rad * 180.0 / PI);
+                  while(erro_mix > 180.0) erro_mix -= 360.0;
+                  while(erro_mix < -180.0) erro_mix += 360.0;
+                  theta_rad += (erro_mix * 0.3) * PI / 180.0;
+              }
+              ant_lat = flat; ant_lon = flon;
+          }
       }
-      ant_lat = flat;
-      ant_lon = flon;
   }
 
   float curso_atual = theta_rad * 180.0 / PI;
@@ -1304,45 +1066,32 @@ void navega_waypoints() {
   if (erro_angular > 180.0) erro_angular -= 360.0;
 
   if (abs(erro_angular) > 35.0) {
+      if (estado_motor_anterior == 0) { parar_motores(); delay(250); }
+      estado_motor_anterior = 1;
+
       int sentido = (erro_angular > 0) ? 1 : -1;
-      mover_motores(85 * sentido, -85 * sentido); // Giro controlado de correção
+      mover_motores(85 * sentido, -85 * sentido);
   } else {
-      int vel_esq = VELOCIDADE_EXPLORACAO; 
-      int vel_dir = VELOCIDADE_EXPLORACAO; 
-      
-      if (erro_angular > 6.0) { 
-          vel_dir = 60;  
-          vel_esq = 90; 
-      } else if (erro_angular < -6.0) { 
-          vel_esq = 60;
-          vel_dir = 90;
-      }
+      if (estado_motor_anterior == 1) { parar_motores(); delay(250); }
+      estado_motor_anterior = 0;
+
+      int vel_esq = VELOCIDADE_EXPLORACAO; int vel_dir = VELOCIDADE_EXPLORACAO; 
+      if (erro_angular > 6.0) { vel_dir = 60; vel_esq = 90; } else if (erro_angular < -6.0) { vel_esq = 60; vel_dir = 90; }
       mover_motores(vel_esq, vel_dir);
   }
 }
 
 // --------------------------------------------------
 void calcula_PID() {
-  P = erro; 
-  I = I + erro; 
-
-  if (I > 50) I = 50;
-  else if (I < -50) I = -50;
+  P = erro; I = I + erro; 
+  if (I > 50) I = 50; else if (I < -50) I = -50;
   if (erro == 0.0) I = 0; 
-
   D = erro - erro_anterior; 
-
   resposta_PID = (Kp * P) + (Ki * I) + (Kd * D); 
   erro_anterior = erro;
-  
-  velocidade_esquerda = VELOCIDADE + resposta_PID; 
-  velocidade_direita =  VELOCIDADE - resposta_PID;
-  
-  if (velocidade_esquerda > VELOCIDADE_MAXIMA) velocidade_esquerda = VELOCIDADE_MAXIMA; 
-  else if (velocidade_esquerda < VELOCIDADE_MINIMA) velocidade_esquerda = VELOCIDADE_MINIMA;
-  
-  if (velocidade_direita > VELOCIDADE_MAXIMA) velocidade_direita = VELOCIDADE_MAXIMA; 
-  else if (velocidade_direita < VELOCIDADE_MINIMA) velocidade_direita = VELOCIDADE_MINIMA;
+  velocidade_esquerda = VELOCIDADE + resposta_PID; velocidade_direita =  VELOCIDADE - resposta_PID;
+  if (velocidade_esquerda > VELOCIDADE_MAXIMA) velocidade_esquerda = VELOCIDADE_MAXIMA; else if (velocidade_esquerda < VELOCIDADE_MINIMA) velocidade_esquerda = VELOCIDADE_MINIMA;
+  if (velocidade_direita > VELOCIDADE_MAXIMA) velocidade_direita = VELOCIDADE_MAXIMA; else if (velocidade_direita < VELOCIDADE_MINIMA) velocidade_direita = VELOCIDADE_MINIMA;
 }
 
 void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t length) {
@@ -1350,7 +1099,7 @@ void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType 
     case WS_EVT_CONNECT: digitalWrite(PINO_LED, HIGH); break;
     case WS_EVT_DISCONNECT:
         if (ws.count() == 0) {
-          digitalWrite(PINO_LED, LOW); modo_linha = false; modo_colisao = false; modo_explora = false; modo_waypoints = false; parar_motores(); estadoManobraAtual = LIVRE; estadoExplora = EXPLORA_LIVRE;
+          digitalWrite(PINO_LED, LOW); modo_linha = false; modo_colisao = false; modo_explora = false; modo_waypoints = false; parar_motores(); estadoManobraAtual = LIVRE; estadoExplora = EXPLORA_LIVRE; total_waypoints = 0;
         } break;
     case WS_EVT_DATA: handleWebSocketMessage(arg, data, length); break;
     case WS_EVT_PONG: case WS_EVT_ERROR: break;
@@ -1358,9 +1107,8 @@ void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType 
 }
 
 void calibrarSensoresLinha() {
-    modo_linha = false; modo_colisao = false; modo_explora = false; modo_waypoints = false; parar_motores(); estadoManobraAtual = LIVRE; estadoExplora = EXPLORA_LIVRE;
-    int leituraInicialLinha = analogRead(SENSOR_LINHA_ESQUERDO); 
-    int minVal = 4095; int maxVal = 0; uint32_t inicio = millis();
+    modo_linha = false; modo_colisao = false; modo_explora = false; modo_waypoints = false; parar_motores(); estadoManobraAtual = LIVRE; estadoExplora = EXPLORA_LIVRE; total_waypoints = 0;
+    int leituraInicialLinha = analogRead(SENSOR_LINHA_ESQUERDO); int minVal = 4095; int maxVal = 0; uint32_t inicio = millis();
     
     while (millis() - inicio < 2500) {
         if (((millis() - inicio) / 250) % 2 == 0) mover_motores(60, -60); else mover_motores(-60, 60);
@@ -1369,9 +1117,7 @@ void calibrarSensoresLinha() {
         if (leituraEsq > maxVal) maxVal = leituraEsq; if (leituraDir > maxVal) maxVal = leituraDir;
         delay(10);
     }
-
-    parar_motores();
-    limiarLinha = (minVal + maxVal) / 2; linha_escura = (leituraInicialLinha > limiarLinha);
+    parar_motores(); limiarLinha = (minVal + maxVal) / 2; linha_escura = (leituraInicialLinha > limiarLinha);
     SPIFFS.begin(DIRETORIO_SPIFFS, false); SPIFFS.putInt("limiar", limiarLinha); SPIFFS.putBool("linha_escura", linha_escura); SPIFFS.end();
     
     JsonDocument json; json["status"] = "calibrado"; json["limiar"] = limiarLinha; json["escura"] = linha_escura;
@@ -1387,7 +1133,7 @@ void verificarSegurancaBateria() {
         leituras_criticas_consecutivas++;
         if (leituras_criticas_consecutivas >= 3) {
             if (!modoSegurancaBateria) {
-                modoSegurancaBateria = true; modo_linha = false; modo_colisao = false; modo_explora = false; modo_waypoints = false; parar_motores(); estadoManobraAtual = LIVRE; estadoExplora = EXPLORA_LIVRE;
+                modoSegurancaBateria = true; modo_linha = false; modo_colisao = false; modo_explora = false; modo_waypoints = false; parar_motores(); estadoManobraAtual = LIVRE; estadoExplora = EXPLORA_LIVRE; total_waypoints = 0;
                 if (ws.count() > 0) ws.textAll("{\"alert\":\"LOW_BATTERY\"}");
             }
             digitalWrite(PINO_LED, (millis() / 150) % 2 ? HIGH : LOW);
