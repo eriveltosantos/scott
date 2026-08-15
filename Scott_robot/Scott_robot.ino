@@ -24,7 +24,7 @@ AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 
 // LED e Sensores Ultrassônicos
-const uint8_t PINO_LED = 15;
+const uint8_t PINO_LED =  15;
 const uint8_t PINO_HCSR04_ECHO = 26;
 const uint8_t PINO_HCSR04_TRIGGER = 25;
 
