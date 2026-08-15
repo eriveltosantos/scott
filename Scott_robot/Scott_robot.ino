@@ -403,7 +403,21 @@ const char index_html[] PROGMEM = R"rawliteral(
         connection.onopen = function () { console.log('Connection opened'); };
         connection.onmessage = function (e) {
             const data = JSON.parse(e.data);
-            if (data["vbat"]) { document.getElementById("vbat").innerText = (data["vbat"] / 1000).toFixed(1); }
+            
+
+            if (data["vbat"]) {
+                let vbat_val = data["vbat"];
+                document.getElementById("vbat").innerText = (vbat_val / 1000).toFixed(1);
+                var lbat = (vbat_val * 100 / 9000).toFixed(0);
+                if(lbat > 100) lbat = 100; if(lbat < 2) lbat = 2;
+                    var lbat_el = document.getElementById("lbat");
+                if(lbat_el) {
+                    lbat_el.style.width = lbat + '%';
+                    lbat_el.style.backgroundColor = (lbat < 20) ? "#F00" : (lbat < 70) ? "orange" : "#0F0";
+                }
+            } 
+
+
             if (data["distancia"]) document.getElementById("distance").innerText = (data["distancia"]).toFixed(0);
             if (data["robot_speed"] !== undefined) document.getElementById("robot-speed").innerText = data["robot_speed"].toFixed(1);
             if (data["fall"] !== undefined) { document.getElementById("fall-status-text").innerText = data["fall"] ? "Fall Detected" : ""; }
@@ -728,6 +742,7 @@ void loop() {
 }
 
 // --------------------------------------------------
+
 void atualizar_odometria_fusao() {
     long pulsos_esq_atual = contador_esq_A;
     long pulsos_dir_atual = contador_dir_A;
@@ -757,13 +772,17 @@ void atualizar_odometria_fusao() {
     gps.f_get_position(&flat, &flon, &age);
     static float ultimo_flat_processado = 0.0;
     
-    if (flat != TinyGPS::GPS_INVALID_F_ANGLE && age < 1500) {
+    // Libera a inicialização assim que houver um sinal de GPS válido, sem travar pelo 'age' estrito
+    if (flat != TinyGPS::GPS_INVALID_F_ANGLE) {
         if (!odometria_inicializada) {
             estimativa_lat = flat; estimativa_lon = flon; ultimo_flat_processado = flat;
             odometria_inicializada = true; heading_gps_valido = false; registrou_inicio_calibracao = false;
         } else {
-            if (flat != ultimo_flat_processado) {
-                estimativa_lat = (estimativa_lat * 0.85) + (flat * 0.15); estimativa_lon = (estimativa_lon * 0.85) + (flon * 0.15); ultimo_flat_processado = flat;
+            if (flat != ultimo_flat_processado && age < 3000) { // Folga maior de tolerância (3 segundos)
+                estimativa_lat = (estimativa_lat * 0.85) + (flat * 0.15); 
+                estimativa_lon = (estimativa_lon * 0.85) + (flon * 0.15); 
+                ultimo_flat_processado = flat;
+                
                 if (!heading_gps_valido && modo_waypoints) {
                     if (!registrou_inicio_calibracao) {
                         lat_inicio_calibracao = flat; lon_inicio_calibracao = flon; pulsos_inicio_calibracao = contador_esq_A; registrou_inicio_calibracao = true;
