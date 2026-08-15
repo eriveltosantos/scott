@@ -1,6 +1,6 @@
 /*******************************************************************************
-* Scott Robot - Kit Robo Explorer - Joystick + Linha + Colisão + Exploração + Waypoints GPS + Voz
-* Controle o seu Rocket Tank pelo celular ou ative os modos autônomos por voz ou dashboard.
+* Scott Robot - Kit Robo Explorer - Joystick + Linha + Colisão + Exploração + Waypoints GPS + Odometria
+* Controle o seu Rocket Tank pelo celular ou ative os modos autônomos.
 *******************************************************************************/
 
 // --------------------------------------------------
@@ -19,13 +19,16 @@
 // --------------------------------------------------
 // Variaveis
 
+// web server assincrono na porta 80
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 
+// LED e Sensores Ultrassônicos
 const uint8_t PINO_LED =  15;
 const uint8_t PINO_HCSR04_ECHO = 26;
 const uint8_t PINO_HCSR04_TRIGGER = 25;
 
+// Configurações do GPS (UART2)
 #define PINO_GPS_RX 16
 #define PINO_GPS_TX 17
 HardwareSerial SerialGPS(2);
@@ -70,6 +73,7 @@ bool registrou_inicio_calibracao = false;
 int sinal_esq = 0; 
 int sinal_dir = 0; 
 
+// ALVOS DE PULSOS PARA MANOBRAS
 const uint32_t PULSOS_30_CM = 100;  
 const uint32_t PULSOS_20_CM = 67;  
 const uint32_t PULSOS_15_CM = 50;  
@@ -77,6 +81,7 @@ const uint32_t PULSOS_180_GRAUS = 260;
 const uint32_t PULSOS_90_GRAUS = 130;  
 const uint32_t PULSOS_45_GRAUS = 65;   
 
+// MAPEAMENTO E VARIÁVEIS DOS ENCODERS
 const int PINO_ENC_ESQ_A = 21; 
 const int PINO_ENC_ESQ_B = 22; 
 const int PINO_ENC_DIR_A = 19; 
@@ -96,6 +101,7 @@ float velocidade_rpm_esq = 0;
 float velocidade_rpm_dir = 0;
 float robot_speed_cms = 0;
 
+// JSON aliases
 const char *ALIAS_ANGULO = "angulo";
 const char *ALIAS_DISTANCIA = "distancia";
 const char *ALIAS_VELOCIDADE = "velocidade";
@@ -114,6 +120,7 @@ const char *ALIAS_COLISAO = "colisao";
 const char *ALIAS_EXPLORA = "explora";
 const char *ALIAS_WAYPOINT = "waypoint";
 
+// Wi-Fi
 bool change_wifi_flag = false;
 String new_wifi_ssid = "";
 String new_wifi_pass = "";
@@ -159,6 +166,9 @@ bool modo_linha = false;
 bool modo_colisao = false;
 bool modo_explora = false;
 
+int contadorColisoes = 0;
+uint32_t tempoUltimaColisao = 0;
+
 enum EstadoManobra { LIVRE, MANOBRA_QUEDA_RE, MANOBRA_QUEDA_GIRO, MANOBRA_PAREDE_RE, MANOBRA_PAREDE_GIRO };
 EstadoManobra estadoManobraAtual = LIVRE;
 unsigned long posicao_inicial_manobra = 0;
@@ -178,6 +188,7 @@ const uint32_t TENSAO_CRITICA = 6400;
 Preferences SPIFFS;
 const char* DIRETORIO_SPIFFS = "seguidor";
 const char* ENDERECOS_SPIFFS[4] = {"espera", "Kp", "Ki", "Kd"};
+const float VALORES_PADROES[4] = {10.0, 6.0, 0.2, 20};
 
 // --------------------------------------------------
 // Pagina web principal
@@ -198,13 +209,13 @@ const char index_html[] PROGMEM = R"rawliteral(
         .battery::before { content: ''; position: absolute; height: 13px; width: 3px; background: #F1F1F1; left: 44px; top: 50%; transform: translateY(-50%); border-radius: 0 3px 3px 0; }
         .part { background: #0F0; top: 1px; left: 1px; bottom: 1px; border-radius: 3px; }
         
+        /* Ajuste na Tabela Principal para caber na tela */
         .grid-3x3 { border-collapse: collapse; margin: 0 auto; background: #fff; width: 100%; max-width: 400px; font-size: 13px; }
         .grid-3x3 td { padding: 6px; border: 2px solid #ECE5E5; text-align: center; }
 
-        #btn-led-linha, #btn-led-colisao, #btn-led-explora, #btn-voz {
-            padding: 16px 12px; font-size: 14px; font-family: inherit; background-color: #444; color: #fff; border: 3px solid #666; border-radius: 10px; cursor: pointer; user-select: none; transition: background-color 0.15s; outline: none; width: 85px;
+        #btn-led-linha, #btn-led-colisao, #btn-led-explora {
+            padding: 16px 20px; font-size: 16px; font-family: inherit; background-color: #444; color: #fff; border: 3px solid #666; border-radius: 10px; cursor: pointer; user-select: none; transition: background-color 0.15s; outline: none; width: 100px;
         }
-        #btn-voz { background-color: #2196F3; border-color: #1976D2; }
         #btn-led-linha.on, #btn-led-colisao.on, #btn-led-explora.on { background-color: #f0be00; border-color: #c49a00; color: #000; font-weight:bold;}
         #btn-led-linha:disabled, #btn-led-colisao:disabled, #btn-led-explora:disabled { background-color: #eee; border-color: #ccc; color: #999; cursor: not-allowed; }
 
@@ -258,10 +269,9 @@ const char index_html[] PROGMEM = R"rawliteral(
                     </div>
                     <canvas id="canvas_joystick"></canvas>
                     <div style="display: flex; width: 100%; justify-content: space-around; align-items: center; margin-top: 15px;">
-                        <div style="text-align: center;"><button id="btn-led-linha" onclick="toggleLed('linha')">Line</button><div style="color: gray; margin-top: 5px; font-size: 9px;" id="led-status-linha">OFF</div></div>
-                        <div style="text-align: center;"><button id="btn-led-explora" onclick="toggleLed('explora')">Explore</button><div style="color: gray; margin-top: 5px; font-size: 9px;" id="led-status-explora">OFF</div></div>
-                        <div style="text-align: center;"><button id="btn-led-colisao" onclick="toggleLed('colisao')">Collision</button><div style="color: gray; margin-top: 5px; font-size: 9px;" id="led-status-colisao">OFF</div></div>
-                        <div style="text-align: center;"><button id="btn-voz" onclick="iniciarReconhecimentoVoz()">🎤 Voice</button><div style="color: gray; margin-top: 5px; font-size: 9px;" id="status-voz">Aguardando</div></div>
+                        <div style="text-align: center;"><button id="btn-led-linha" onclick="toggleLed('linha')">Line</button><div style="color: gray; margin-top: 5px; font-size: 10px;" id="led-status-linha">OFF</div></div>
+                        <div style="text-align: center;"><button id="btn-led-explora" onclick="toggleLed('explora')">Explore</button><div style="color: gray; margin-top: 5px; font-size: 10px;" id="led-status-explora">OFF</div></div>
+                        <div style="text-align: center;"><button id="btn-led-colisao" onclick="toggleLed('colisao')">Collision</button><div style="color: gray; margin-top: 5px; font-size: 10px;" id="led-status-colisao">OFF</div></div>
                     </div>
                     <div id="fall-message-container" style="width: 100%; text-align: center; margin-top: 15px;">
                         <span id="fall-status-text" style="font-size: 18px; font-weight: bold; color: #ccc; transition: color 0.2s;"></span><br>
@@ -283,7 +293,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         <div class="setup-container">
             <div class="setup-box" style="max-width: 360px;">
                 <span class="setup-title">Navegação por Waypoints</span>
-                <div id="wp-current-loc" style="text-align: center; font-weight: bold; color: #2196F3; margin-bottom: 10px; font-size: 14px;">Lat: -- | Lon: --</div>
+                <div id="wp-current-loc" style="text-align: center; font-weight: bold; color: #2196F3; margin-bottom: 10px; font-size: 15px;">Lat: -- | Lon: --</div>
                 
                 <table style="width: 100%; text-align: center; border-collapse: collapse; margin-bottom: 15px; font-size: 13px;">
                     <tr style="background:#eee; height:30px;"><th>ID</th><th>Lat</th><th>Lon</th><th>Ação</th></tr>
@@ -307,6 +317,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     </div>
 
     <div id="tab-setup" class="tab-content">
+        <!-- Setup Mantido igual -->
         <div class="setup-container">
             <div class="setup-box">
                 <span class="setup-title">PID Control</span>
@@ -434,63 +445,6 @@ const char index_html[] PROGMEM = R"rawliteral(
             if(led_state[tipo]){ btn.classList.add("on"); status.innerText = "ON"; } else { btn.classList.remove("on"); status.innerText = "OFF"; }
             safelySend(led_state);
         }
-
-        // --- INTEGRAÇÃO DE RECONHECIMENTO DE VOZ (API SAFARI / IOS) ---
-        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-        let recognition;
-
-        if (SpeechRecognition) {
-            recognition = new SpeechRecognition();
-            recognition.lang = 'pt-BR';
-            recognition.continuous = false;
-            recognition.interimResults = false;
-
-            recognition.onstart = function() {
-                document.getElementById("status-voz").innerText = "Ouvindo...";
-                document.getElementById("status-voz").style.color = "#f0be00";
-            };
-
-            recognition.onresult = function(event) {
-                const comando = event.results[0][0].transcript.toLowerCase();
-                document.getElementById("status-voz").innerText = "Cmd: " + comando;
-                document.getElementById("status-voz").style.color = "#4CAF50";
-                
-                if (comando.includes("frente")) { safelySend({"velocidade": 80, "angulo": 90}); }
-                else if (comando.includes("trás") || comando.includes("ré")) { safelySend({"velocidade": 80, "angulo": 270}); }
-                else if (comando.includes("esquerda")) { safelySend({"velocidade": 80, "angulo": 180}); }
-                else if (comando.includes("direita")) { safelySend({"velocidade": 80, "angulo": 0}); }
-                else if (comando.includes("pare") || comando.includes("parar")) { safelySend({"stop": 1}); resetModosAutonomosVisual(); }
-                else if (comando.includes("linha")) { if(!led_state.linha) toggleLed('linha'); }
-                else if (comando.includes("explorar") || comando.includes("casa")) { if(!led_state.explora) toggleLed('explora'); }
-                else if (comando.includes("colisão")) { if(!led_state.colisao) toggleLed('colisao'); }
-                else {
-                    document.getElementById("status-voz").innerText = "? " + comando;
-                    document.getElementById("status-voz").style.color = "#f44336";
-                }
-            };
-
-            recognition.onerror = function(event) {
-                document.getElementById("status-voz").innerText = "Erro voz";
-                document.getElementById("status-voz").style.color = "#f44336";
-            };
-
-            recognition.onend = function() {
-                if (document.getElementById("status-voz").innerText === "Ouvindo...") {
-                    document.getElementById("status-voz").innerText = "Aguardando";
-                    document.getElementById("status-voz").style.color = "gray";
-                }
-            };
-        } else {
-            document.getElementById("status-voz").innerText = "Indisponível";
-        }
-
-        function iniciarReconhecimentoVoz() {
-            if (recognition) {
-                try { recognition.start(); } catch(e) {}
-            } else {
-                alert("API de Voz não suportada neste navegador.");
-            }
-        }
     </script>
     <script>
         var canvas_joystick, ctx_joystick, width, height, radius, button_size;
@@ -536,6 +490,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         function resetModosAutonomosVisual() {
             led_state.linha = false; led_state.colisao = false; led_state.explora = false;
             ['linha', 'colisao', 'explora'].forEach(k => { document.getElementById("btn-led-" + k).classList.remove("on"); document.getElementById("led-status-" + k).innerText = "OFF"; });
+            // Ao iniciar movimentação pelo JoyStick, cancela qualquer missão ativa para o usuário
             if(document.getElementById("waypoint_status").innerText.includes("Iniciando") || document.getElementById("waypoint_status").innerText.includes("Navegando")) {
                 document.getElementById("waypoint_status").innerText = "Status: Cancelado pelo Joystick";
                 document.getElementById("waypoint_status").style.color = "#f44336";
@@ -564,7 +519,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 )rawliteral";
 
 // --------------------------------------------------
-// Declaração de Funções e Lógica C++
+// Declaracao das funcoes do codigo
 
 void configurar_servidor_web(void);
 void handleWebSocketMessage(void *, uint8_t *, size_t);
@@ -579,14 +534,21 @@ void navega_waypoints(void);
 void calibrarSensoresLinha(void);
 void verificarSegurancaBateria(void);
 
+// Funções para controle com rastreamento para Odometria
 void mover_motores(int v_esq, int v_dir);
 void parar_motores();
 void atualizar_odometria_fusao();
+
+// --------------------------------------------------
+// INTERRUPÇÕES DOS ENCODERS
 
 void IRAM_ATTR isr_esq_A() { contador_esq_A++; }
 void IRAM_ATTR isr_esq_B() { contador_esq_B++; }
 void IRAM_ATTR isr_dir_A() { contador_dir_A++; }
 void IRAM_ATTR isr_dir_B() { contador_dir_B++; }
+
+// --------------------------------------------------
+// FUNÇÕES WRAPPER DE MOTORES PARA ODOMETRIA
 
 void mover_motores(int v_esq, int v_dir) {
     sinal_esq = (v_esq > 0) ? 1 : ((v_esq < 0) ? -1 : 0);
@@ -600,12 +562,16 @@ void parar_motores() {
     motores.stop();
 }
 
+// --------------------------------------------------
+
 void setup() {
   Serial.begin(115200);
   
   SerialGPS.setRxBufferSize(1024);
   SerialGPS.begin(9600, SERIAL_8N1, PINO_GPS_RX, PINO_GPS_TX);
   
+  Serial.println("RoboCore - Kit Robo Explorer - Waypoints GPS Multi");
+
   pinMode(PINO_LED, OUTPUT);
   digitalWrite(PINO_LED, LOW);
 
@@ -761,6 +727,7 @@ void loop() {
   delay(1); 
 }
 
+// --------------------------------------------------
 void atualizar_odometria_fusao() {
     long pulsos_esq_atual = contador_esq_A;
     long pulsos_dir_atual = contador_dir_A;
@@ -813,6 +780,7 @@ void atualizar_odometria_fusao() {
     }
 }
 
+// --------------------------------------------------
 void configurar_servidor_web(void) {
   ws.onEvent(onEvent); server.addHandler(&ws);
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) { request->send_P(200, "text/html", index_html); });
@@ -882,14 +850,10 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t length) {
       }
       controlar_motor(data, length);
     } 
-    else if (strstr(reinterpret_cast<char *>(data), ALIAS_PARA) != nullptr) {
-      modo_linha = false; modo_colisao = false; modo_explora = false; modo_waypoints = false; total_waypoints = 0;
-      parar_motores(); estadoManobraAtual = LIVRE; estadoExplora = EXPLORA_LIVRE;
-      ws.textAll("{\"fall\":false, \"stuck\":false, \"waypoint_status\":\"Parado / Inativo\"}");
-    }
   }
 }
 
+// --------------------------------------------------
 int16_t ler_distancia(void) {
   int16_t leituras[3];
   for (int i = 0; i < 3; i++) {
@@ -919,6 +883,7 @@ void atualizar_sensor_ultrassonico(void) {
   }
 }
 
+// --------------------------------------------------
 void segue_linha() {
   leitura_esquerdo = analogRead(SENSOR_LINHA_ESQUERDO); leitura_direito = analogRead(SENSOR_LINHA_DIREITO);
   bool ve_esq = (leitura_esquerdo > limiarLinha); bool ve_dir = (leitura_direito > limiarLinha);
@@ -1013,6 +978,7 @@ void explora_casa() {
   }
 }
 
+// --------------------------------------------------
 void navega_waypoints() {
   if (!odometria_inicializada || total_waypoints == 0 || waypoint_atual_idx >= total_waypoints) {
       parar_motores();
@@ -1032,12 +998,14 @@ void navega_waypoints() {
       return;
   }
 
+  // FASE 1: CALIBRAÇÃO DA BÚSSOLA GEOMÉTRICA
   if (!heading_gps_valido) {
       mover_motores(VELOCIDADE_EXPLORACAO, VELOCIDADE_EXPLORACAO);
       if (ws.count() > 0) ws.textAll("{\"waypoint_status\":\"Calibrando Direcao...\"}");
       return; 
   }
 
+  // FASE 2: VERIFICAÇÃO DE CHEGADA (Raio de 1.0m)
   float distancia_alvo = TinyGPS::distance_between(estimativa_lat, estimativa_lon, target_lat, target_lon);
   if (distancia_alvo < 1.0) {
       parar_motores();
@@ -1065,6 +1033,7 @@ void navega_waypoints() {
       ws.textAll(msgStatus);
   }
 
+  // FASE 3: NAVEGAÇÃO RETA CORRIGIDA POR GPS E FILTRO ANTI-STALL
   float curso_alvo = TinyGPS::course_to(estimativa_lat, estimativa_lon, target_lat, target_lon);
   
   float flat, flon; unsigned long age;
@@ -1112,6 +1081,7 @@ void navega_waypoints() {
   }
 }
 
+// --------------------------------------------------
 void calcula_PID() {
   P = erro; I = I + erro; 
   if (I > 50) I = 50; else if (I < -50) I = -50;
