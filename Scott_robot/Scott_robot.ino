@@ -1305,7 +1305,7 @@ void navega_waypoints() {
 
   if (abs(erro_angular) > 35.0) {
       int sentido = (erro_angular > 0) ? 1 : -1;
-      mover_motores(75 * sentido, -75 * sentido); // Giro controlado de correção
+      mover_motores(85 * sentido, -85 * sentido); // Giro controlado de correção
   } else {
       int vel_esq = VELOCIDADE_EXPLORACAO; 
       int vel_dir = VELOCIDADE_EXPLORACAO; 
