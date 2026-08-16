@@ -52,6 +52,12 @@ uint32_t alvoPulsosWay = 0;
 uint32_t tempo_inicio_manobra_way = 0;
 int sentido_giro_way = 1; 
 
+// --- ANTI-STALL DA NAVEGAÇÃO POR WAYPOINT (correção angular oscilando sem convergir) ---
+const uint32_t TIMEOUT_GIRO_WAYPOINT = 3500;   // tempo máximo girando/corrigindo sem sair da zona de correção
+const uint32_t EMPURRAO_ANTISTALL_WAYPOINT_MS = 700; // duração do avanço reto forçado para quebrar o travamento
+const int LIMITE_GIROS_ANTISTALL_WAYPOINT = 3; // quantas vezes o timeout pode disparar antes de abortar a navegação
+int giros_consecutivos_way = 0;
+
 // --- VARIÁVEIS DE ODOMETRIA E FUSÃO (Dead Reckoning) ---
 const float CM_POR_PULSO = 30.0 / 100.0;
 const float LARGURA_ESTEIRA_EFETIVA = (260.0 * 0.3 * 2.0) / PI;
@@ -822,18 +828,15 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t length) {
   if (info->final && info->index == 0 && info->len == length && info->opcode == WS_TEXT) {
     data[length] = 0;
 
-    if (strstr(reinterpret_cast<char *>(data), "wp_queda") != nullptr) {
-        JsonDocument json; deserializeJson(json, data, length);
-        if(json.containsKey("wp_queda")) wp_evita_queda = json["wp_queda"].as<bool>();
-        if(json.containsKey("wp_colisao")) wp_evita_colisao = json["wp_colisao"].as<bool>();
-    }
-    else if (strstr(reinterpret_cast<char *>(data), ALIAS_WAYPOINT) != nullptr) {
+    if (strstr(reinterpret_cast<char *>(data), ALIAS_WAYPOINT) != nullptr) {
       JsonDocument json; deserializeJson(json, data, length);
+      if(json.containsKey("wp_queda")) wp_evita_queda = json["wp_queda"].as<bool>();
+      if(json.containsKey("wp_colisao")) wp_evita_colisao = json["wp_colisao"].as<bool>();
       modo_waypoints = json[ALIAS_WAYPOINT].as<bool>();
       if (modo_waypoints) {
           modo_linha = false; modo_colisao = false; modo_explora = false;
           estadoWay = WAY_LIVRE; heading_gps_valido = false; registrou_inicio_calibracao = false;
-          total_waypoints = 0; waypoint_atual_idx = 0;
+          total_waypoints = 0; waypoint_atual_idx = 0; giros_consecutivos_way = 0;
           
           JsonArray list = json["list"].as<JsonArray>();
           for(JsonVariant v : list) {
@@ -846,6 +849,11 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t length) {
       } else {
           parar_motores(); total_waypoints = 0;
       }
+    }
+    else if (strstr(reinterpret_cast<char *>(data), "wp_queda") != nullptr) {
+        JsonDocument json; deserializeJson(json, data, length);
+        if(json.containsKey("wp_queda")) wp_evita_queda = json["wp_queda"].as<bool>();
+        if(json.containsKey("wp_colisao")) wp_evita_colisao = json["wp_colisao"].as<bool>();
     }
     else if (strstr(reinterpret_cast<char *>(data), ALIAS_LINHA) != nullptr || strstr(reinterpret_cast<char *>(data), ALIAS_COLISAO) != nullptr || strstr(reinterpret_cast<char *>(data), ALIAS_EXPLORA) != nullptr) {
       JsonDocument json; deserializeJson(json, data, length);
@@ -1001,6 +1009,10 @@ void explora_casa() {
 void navega_waypoints() {
   if (!odometria_inicializada || total_waypoints == 0 || waypoint_atual_idx >= total_waypoints) {
       parar_motores();
+      if (ws.count() > 0) {
+          if (!odometria_inicializada) ws.textAll("{\"waypoint_status\":\"Cancelado: sem sinal de GPS valido\"}");
+          else if (total_waypoints == 0) ws.textAll("{\"waypoint_status\":\"Cancelado: nenhum waypoint valido recebido\"}");
+      }
       modo_waypoints = false;
       return; 
   }
@@ -1028,6 +1040,7 @@ void navega_waypoints() {
   float distancia_alvo = TinyGPS::distance_between(estimativa_lat, estimativa_lon, target_lat, target_lon);
   if (distancia_alvo < 1.0) {
       parar_motores();
+      giros_consecutivos_way = 0;
       waypoint_atual_idx++;
       if (waypoint_atual_idx >= total_waypoints) {
           modo_waypoints = false;
@@ -1085,14 +1098,37 @@ void navega_waypoints() {
   if (erro_angular > 180.0) erro_angular -= 360.0;
 
   if (abs(erro_angular) > 35.0) {
-      if (estado_motor_anterior == 0) { parar_motores(); delay(250); }
+      if (estado_motor_anterior == 0) { parar_motores(); delay(250); tempo_inicio_manobra_way = millis(); }
       estado_motor_anterior = 1;
+
+      // ANTI-STALL: ficou girando/corrigindo por tempo demais sem sair da zona de correção (oscilação de rumo por ruído de GPS)
+      if (millis() - tempo_inicio_manobra_way > TIMEOUT_GIRO_WAYPOINT) {
+          giros_consecutivos_way++;
+
+          if (giros_consecutivos_way >= LIMITE_GIROS_ANTISTALL_WAYPOINT) {
+              parar_motores();
+              modo_waypoints = false;
+              giros_consecutivos_way = 0;
+              if (ws.count() > 0) ws.textAll("{\"waypoint_status\":\"Cancelado: travado corrigindo rumo (anti-stall)\"}");
+              return;
+          }
+
+          if (ws.count() > 0) ws.textAll("{\"waypoint_status\":\"Anti-stall: forcando avanco reto\"}");
+          parar_motores(); delay(150);
+          mover_motores(VELOCIDADE_EXPLORACAO, VELOCIDADE_EXPLORACAO);
+          delay(EMPURRAO_ANTISTALL_WAYPOINT_MS);
+          parar_motores(); delay(150);
+          estado_motor_anterior = 0;
+          tempo_inicio_manobra_way = millis();
+          return;
+      }
 
       int sentido = (erro_angular > 0) ? 1 : -1;
       mover_motores(85 * sentido, -85 * sentido);
   } else {
       if (estado_motor_anterior == 1) { parar_motores(); delay(250); }
       estado_motor_anterior = 0;
+      giros_consecutivos_way = 0;
 
       int vel_esq = VELOCIDADE_EXPLORACAO; int vel_dir = VELOCIDADE_EXPLORACAO; 
       if (erro_angular > 6.0) { vel_dir = 60; vel_esq = 90; } else if (erro_angular < -6.0) { vel_esq = 60; vel_dir = 90; }
