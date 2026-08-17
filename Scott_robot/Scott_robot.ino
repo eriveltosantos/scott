@@ -322,13 +322,6 @@ const char index_html[] PROGMEM = R"rawliteral(
         <div id="map-container" style="position: relative; width: 100%; height: 500px; background: #fff; border-radius: 8px; overflow: hidden; margin: 0 auto; max-width: 95%;">
             <div id="map" style="width: 100%; height: 100%; display: block;"></div>
         </div>
-        
-        <div style="margin: 20px auto; max-width: 95%; background: white; padding: 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
-            <h4 style="color: #333; text-align: center; margin-top: 0; font-weight: bold;">⚠️ Obstáculos Identificados (Antena Virtual)</h4>
-            <ul id="virtual-obstacles-list" style="list-style: none; padding: 0; margin: 0; max-height: 200px; overflow-y: auto; font-size: 14px;">
-                <li id="no-obstacles-msg" style="text-align: center; color: #777;">Nenhum obstáculo na memória local detectado.</li>
-            </ul>
-        </div>
     </div>
 
     <div id="tab-waypoint" class="tab-content">
@@ -379,13 +372,6 @@ const char index_html[] PROGMEM = R"rawliteral(
                 <div class="input-group"><div class="input-group-addon">Pass</div><input type="password" id="wifi_pass" placeholder="Network password" class="input"></div>
                 <button type="button" class="btn btn-warning" onclick="send_wifi()">Connect</button>
             </div>
-            
-            <div class="setup-box">
-                <span class="setup-title">Memória do Mapa (Obstáculos)</span>
-                <button type="button" class="btn btn-warning" onclick="salvarAntenas()">Salvar Mapa em Arquivo</button>
-                <input type="file" id="file-antenas" style="display:none;" accept=".json" onchange="carregarETransmitirAntenas(event)">
-                <button type="button" class="btn" style="background-color: #2196F3; color: white;" onclick="document.getElementById('file-antenas').click()">Carregar e Transmitir Mapa</button>
-            </div>
         </div>
     </div>
     
@@ -396,65 +382,6 @@ const char index_html[] PROGMEM = R"rawliteral(
 
         let lat = null, lon = null, lastMapUpdate = 0, map = null, marcador = null;
         let wp_queda = true, wp_colisao = true;
-
-        window.virtualObstaclesData = [];
-
-        function renderVirtualObstaclesList() {
-            let obsList = document.getElementById("virtual-obstacles-list");
-            if (!obsList) return;
-            obsList.innerHTML = ""; 
-            
-            if (window.virtualObstaclesData.length === 0) {
-                obsList.innerHTML = '<li id="no-obstacles-msg" style="text-align: center; color: #777;">Nenhum obstáculo na memória local detectado.</li>';
-                return;
-            }
-            
-            let arrReverso = [...window.virtualObstaclesData].reverse();
-            arrReverso.forEach(obs => {
-                let li = document.createElement("li");
-                li.style.borderBottom = "1px solid #eee";
-                li.style.padding = "8px 5px";
-                li.innerHTML = `<span style="color:#f44336; font-weight:bold;">[${obs.time}]</span> Antena detectou obstáculo em <b>X: ${obs.x.toFixed(0)}cm, Y: ${obs.y.toFixed(0)}cm</b>.`;
-                obsList.appendChild(li);
-            });
-        }
-
-        function salvarAntenas() {
-            if (window.virtualObstaclesData.length === 0) { 
-                alert("Nenhum obstáculo registrado para salvar!"); 
-                return; 
-            }
-            let dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(window.virtualObstaclesData));
-            let downloadAnchorNode = document.createElement('a');
-            downloadAnchorNode.setAttribute("href", dataStr);
-            downloadAnchorNode.setAttribute("download", "scott_mapa_obstaculos.json");
-            document.body.appendChild(downloadAnchorNode);
-            downloadAnchorNode.click();
-            downloadAnchorNode.remove();
-        }
-
-        function carregarETransmitirAntenas(event) {
-            let file = event.target.files[0];
-            if (!file) return;
-            
-            let reader = new FileReader();
-            reader.onload = function(e) {
-                try {
-                    let list = JSON.parse(e.target.result);
-                    window.virtualObstaclesData = list;
-                    renderVirtualObstaclesList(); 
-                    
-                    safelySend({ cmd: "load_obstacles", list: list });
-                    
-                    alert(`${list.length} obstáculos carregados e injetados na memória do Scott!`);
-                    showTab('map');
-                } catch(err) {
-                    alert("Erro ao ler o arquivo de mapa.\nDetalhe: " + err);
-                }
-                event.target.value = ''; 
-            };
-            reader.readAsText(file);
-        }
 
         function toggleWpSafety(tipo) {
             if(tipo === 'queda') { wp_queda = !wp_queda; document.getElementById("btn-wp-queda").innerText = "Queda: " + (wp_queda?"ON":"OFF"); document.getElementById("btn-wp-queda").style.backgroundColor = wp_queda?"#f0be00":"#ccc"; }
@@ -541,26 +468,6 @@ const char index_html[] PROGMEM = R"rawliteral(
             }
             if (data["date"] !== undefined) document.getElementById("gps-date").innerText = data["date"];
             if (data["time"] !== undefined) document.getElementById("gps-time").innerText = data["time"];
-
-            if (data["virt_obs"] === true) {
-                let rx = data["map_raw_x"] || 0;
-                let ry = data["map_raw_y"] || 0;
-                let rtheta = data["map_raw_theta"] || 0;
-                
-                let obs_x = rx + 20 * Math.cos(rtheta);
-                let obs_y = ry + 20 * Math.sin(rtheta);
-
-                let diffTime = Date.now() - (window.lastVirtualObsTime || 0);
-                if (diffTime > 1500) { 
-                    window.virtualObstaclesData.push({ 
-                        time: new Date().toLocaleTimeString(), 
-                        x: obs_x, 
-                        y: obs_y 
-                    });
-                    renderVirtualObstaclesList();
-                    window.lastVirtualObsTime = Date.now();
-                }
-            }
         };
 
         function showTab(tab) {
@@ -762,8 +669,21 @@ void setup() {
   linha_escura = SPIFFS.getBool("linha_escura", true);
   SPIFFS.end();
 
-  // Carrega o mapa salvo para as Antenas Virtuais
-  carregar_mapa_salvo();
+  // BUGFIX "parede virtual": carregar_mapa_salvo() populava occupancyMap[][]
+  // com os obstáculos gravados na sessão ANTERIOR, mas robot_local_x_cm,
+  // robot_local_y_cm e theta_rad sempre reiniciam em 0.0 a cada boot.
+  // Ou seja, o mapa antigo fica ancorado na pose de onde o robô estava
+  // ligado da última vez, e é reinterpretado como se fosse a pose atual.
+  // Se o Scott for ligado em outro lugar/ângulo (o caso normal), as células
+  // marcadas como obstáculo (2) aparecem projetadas à frente do robô mesmo
+  // sem nada ali de verdade — a "antena virtual" acusa uma parede fantasma.
+  // Correção: começar cada sessão com o grid limpo; ele volta a ser
+  // preenchido em tempo real pelos sensores conforme o robô se move.
+  memset(occupancyMap, 0, sizeof(occupancyMap));
+  // Se quiser reativar a persistência de mapa entre sessões, é necessário
+  // antes implementar uma etapa de "recalibração de pose" (ex.: usuário
+  // confirma via app que o robô está no mesmo ponto/orientação inicial de
+  // quando o mapa foi salvo) antes de chamar carregar_mapa_salvo().
 }
 
 void loop() {
@@ -893,7 +813,6 @@ void processar_mapeamento_e_telemetria(void) {
             json["map_raw_y"] = robot_local_y_cm;
             json["map_raw_theta"] = theta_rad;
             json["map_raw_dist"] = distancia;
-            json["virt_obs"] = obstaculo_virtual_detectado(DISTANCIA_OBSTACULO);
             
             size_t msg_comp = measureJson(json); 
             char msg[msg_comp + 1]; 
@@ -1030,28 +949,13 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t length) {
   if (info->final && info->index == 0 && info->len == length && info->opcode == WS_TEXT) {
     data[length] = 0;
 
-    if (strstr(reinterpret_cast<char *>(data), "load_obstacles") != nullptr) {
-        JsonDocument json;
-        deserializeJson(json, data, length);
-        JsonArray list = json["list"].as<JsonArray>();
-        
-        for(JsonVariant v : list) {
-            float obs_x = v["x"].as<float>();
-            float obs_y = v["y"].as<float>();
-            
-            // Converte a coordenada cm para a célula da grid
-            int grid_x = (int)(obs_x / MAP_RESOLUTION_CM) + (MAP_WIDTH / 2);
-            int grid_y = (int)(obs_y / MAP_RESOLUTION_CM) + (MAP_HEIGHT / 2);
-            
-            // Se estiver dentro dos limites do mapa (100x100), marca como obstáculo (2)
-            if (grid_x >= 0 && grid_x < MAP_WIDTH && grid_y >= 0 && grid_y < MAP_HEIGHT) {
-                occupancyMap[grid_x][grid_y] = 2; 
-            }
-        }
-        return;
+    if (strstr(reinterpret_cast<char *>(data), "calibrate_line") != nullptr) {
+      // BUGFIX: o botão "Calibrate Sensors" envia {"cmd":"calibrate_line"},
+      // mas nenhum ramo deste parser reconhecia essa mensagem — ela caía
+      // no vazio e calibrarSensoresLinha() nunca era chamada.
+      calibrarSensoresLinha();
     }
-
-    if (strstr(reinterpret_cast<char *>(data), ALIAS_WAYPOINT) != nullptr) {
+    else if (strstr(reinterpret_cast<char *>(data), ALIAS_WAYPOINT) != nullptr) {
       JsonDocument json; deserializeJson(json, data, length);
       if(json.containsKey("wp_queda")) wp_evita_queda = json["wp_queda"].as<bool>();
       if(json.containsKey("wp_colisao")) wp_evita_colisao = json["wp_colisao"].as<bool>();
@@ -1164,7 +1068,8 @@ void evita_colisao() {
   int leitura_esq = analogRead(SENSOR_LINHA_ESQUERDO); int leitura_dir = analogRead(SENSOR_LINHA_DIREITO);
   
   // O obstáculo existe fisicamente na frente OU o mapa avisou que ele existe via Antena Virtual
-  bool obstaculo_frente = ((distancia > 0) && (distancia <= DISTANCIA_OBSTACULO)) || obstaculo_virtual_detectado(DISTANCIA_OBSTACULO);
+  //bool obstaculo_frente = ((distancia > 0) && (distancia <= DISTANCIA_OBSTACULO)) || obstaculo_virtual_detectado(DISTANCIA_OBSTACULO);
+  bool obstaculo_frente = ((distancia > 0) && (distancia <= DISTANCIA_OBSTACULO));
   bool queda_detectada = (leitura_esq > LIMIAR_QUEDA) || (leitura_dir > LIMIAR_QUEDA);
 
   static bool status_queda_ui = false;
@@ -1181,7 +1086,9 @@ void evita_colisao() {
 
 void explora_casa() {
   // O obstáculo existe fisicamente na frente OU o mapa avisou que ele existe via Antena Virtual
-  bool obstaculo_frente = ((distancia > 0) && (distancia <= DISTANCIA_EXPLORACAO)) || obstaculo_virtual_detectado(DISTANCIA_EXPLORACAO);
+  //bool obstaculo_frente = ((distancia > 0) && (distancia <= DISTANCIA_EXPLORACAO)) || obstaculo_virtual_detectado(DISTANCIA_EXPLORACAO);
+  bool obstaculo_frente = ((distancia > 0) && (distancia <= DISTANCIA_EXPLORACAO));
+
   bool queda_detectada = (analogRead(SENSOR_LINHA_ESQUERDO) > LIMIAR_QUEDA) || (analogRead(SENSOR_LINHA_DIREITO) > LIMIAR_QUEDA);
   static bool status_queda_ui_explora = false;
 
@@ -1201,7 +1108,9 @@ void explora_casa() {
           if ((contador_esq_A - posicao_inicial_explora) >= alvoPulsosExplora) {
               parar_motores(); delay(100); giros_consecutivos++;
 
-              bool ainda_obstaculo = ((distancia > 0) && (distancia <= DISTANCIA_EXPLORACAO)) || obstaculo_virtual_detectado(DISTANCIA_EXPLORACAO);
+             // bool ainda_obstaculo = ((distancia > 0) && (distancia <= DISTANCIA_EXPLORACAO)) || obstaculo_virtual_detectado(DISTANCIA_EXPLORACAO);
+              bool ainda_obstaculo = ((distancia > 0) && (distancia <= DISTANCIA_EXPLORACAO));
+
               bool ainda_queda = (analogRead(SENSOR_LINHA_ESQUERDO) > LIMIAR_QUEDA) || (analogRead(SENSOR_LINHA_DIREITO) > LIMIAR_QUEDA);
 
               if (ainda_obstaculo || ainda_queda) {
@@ -1246,7 +1155,8 @@ void navega_waypoints() {
   float target_lat = waypoints_lat[waypoint_atual_idx];
   float target_lon = waypoints_lon[waypoint_atual_idx];
 
-  bool obstaculo_frente = wp_evita_colisao && (((distancia > 0) && (distancia <= DISTANCIA_OBSTACULO)) || obstaculo_virtual_detectado(DISTANCIA_OBSTACULO));
+  //bool obstaculo_frente = wp_evita_colisao && (((distancia > 0) && (distancia <= DISTANCIA_OBSTACULO)) || obstaculo_virtual_detectado(DISTANCIA_OBSTACULO));
+  bool obstaculo_frente = wp_evita_colisao && (((distancia > 0) && (distancia <= DISTANCIA_OBSTACULO));
   bool queda_detectada = wp_evita_queda && ((analogRead(SENSOR_LINHA_ESQUERDO) > LIMIAR_QUEDA) || (analogRead(SENSOR_LINHA_DIREITO) > LIMIAR_QUEDA));
 
   if (obstaculo_frente || queda_detectada) {
