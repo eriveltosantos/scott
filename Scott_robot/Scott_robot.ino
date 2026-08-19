@@ -13,7 +13,7 @@
 #include <ESPAsyncWebServer.h>  
 #include <ArduinoJson.h>        
 #include <Preferences.h>
-#include <LittleFS.h>           // Adicionado para ler o mapa salvo (LittleFS substitui SPIFFS antigo)
+#include <LittleFS.h>           
 #include <RoboCore_Vespa.h>
 #include <TinyGPS.h>            
 
@@ -53,10 +53,10 @@ uint32_t alvoPulsosWay = 0;
 uint32_t tempo_inicio_manobra_way = 0;
 int sentido_giro_way = 1; 
 
-// --- ANTI-STALL DA NAVEGAÇÃO POR WAYPOINT (corrigido para piso intertravado) ---
-const uint32_t TIMEOUT_GIRO_WAYPOINT = 4000;         // Dá mais tempo para o giro lento se completar
-const uint32_t EMPURRAO_ANTISTALL_WAYPOINT_MS = 1200; // Empurrão mais longo para garantir a saída de fendas do piso
-const int LIMITE_GIROS_ANTISTALL_WAYPOINT = 4;       // Maior tolerância de tentativas antes de abortar
+// --- ANTI-STALL DA NAVEGAÇÃO POR WAYPOINT ---
+const uint32_t TIMEOUT_GIRO_WAYPOINT = 4000;         
+const uint32_t EMPURRAO_ANTISTALL_WAYPOINT_MS = 1200; 
+const int LIMITE_GIROS_ANTISTALL_WAYPOINT = 4;       
 int giros_consecutivos_way = 0;
 
 // --- VARIÁVEIS DE ODOMETRIA E FUSÃO (Dead Reckoning) ---
@@ -81,29 +81,27 @@ int sinal_esq = 0;
 int sinal_dir = 0; 
 
 // --- MAPEAMENTO LOCAL (GRID MAPPING) ---
-#define MAP_WIDTH 100   // Aumentado para 5 metros de mapa (100 * 5cm)
-#define MAP_HEIGHT 100  // Aumentado para 5 metros
+#define MAP_WIDTH 100   
+#define MAP_HEIGHT 100  
 #define MAP_RESOLUTION_CM 5
-int8_t occupancyMap[MAP_WIDTH][MAP_HEIGHT]; // 0=Desconhecido, 1=Livre, 2=Ocupado
+int8_t occupancyMap[MAP_WIDTH][MAP_HEIGHT]; 
 
 float robot_local_x_cm = 0.0;
 float robot_local_y_cm = 0.0;
-const float MAX_SENSOR_DIST_CM = 150.0; // Ignora ecos distantes para o mapa local
+const float MAX_SENSOR_DIST_CM = 150.0; 
 uint32_t timeout_map_ws = 0;
 
 // --- NOVA FUNÇÃO: ANTENA VIRTUAL ---
 bool obstaculo_virtual_detectado(float distancia_projecao_cm) {
-    // Projeta um ponto à frente do robô
     float alvo_x = robot_local_x_cm + distancia_projecao_cm * cos(theta_rad);
     float alvo_y = robot_local_y_cm + distancia_projecao_cm * sin(theta_rad);
 
     int grid_x = (int)(alvo_x / MAP_RESOLUTION_CM) + (MAP_WIDTH / 2);
     int grid_y = (int)(alvo_y / MAP_RESOLUTION_CM) + (MAP_HEIGHT / 2);
 
-    // Verifica se a célula projetada está na memória e se é um obstáculo (2)
     if (grid_x >= 0 && grid_x < MAP_WIDTH && grid_y >= 0 && grid_y < MAP_HEIGHT) {
         if (occupancyMap[grid_x][grid_y] == 2) {
-            return true; // Parede/Obstáculo conhecido detectado pelo mapa!
+            return true; 
         }
     }
     return false;
@@ -205,6 +203,7 @@ EstadoManobra estadoManobraAtual = LIVRE;
 unsigned long posicao_inicial_manobra = 0;
 uint32_t alvoPulsosManobra = 0;
 
+// --- MÁQUINA DE ESTADOS EXPLORAÇÃO SIMPLIFICADA E SORTEADA ---
 enum EstadoExploracao { EXPLORA_LIVRE, EXPLORA_RE, EXPLORA_GIRO, EXPLORA_PARADO };
 EstadoExploracao estadoExplora = EXPLORA_LIVRE;
 int giros_consecutivos = 0; 
@@ -212,18 +211,18 @@ unsigned long posicao_inicial_explora = 0;
 uint32_t alvoPulsosExplora = 0; 
 uint32_t tempo_inicio_manobra_explora = 0; 
 const uint32_t TIMEOUT_MAX_EXPLORA = 6000;  
+int sentido_giro_atual = 1;
 
 bool modoSegurancaBateria = false;
 const uint32_t TENSAO_CRITICA = 6400;
 
-Preferences SPIFFS; // Mantido original apenas para os dados do PID
+Preferences SPIFFS; 
 const char* DIRETORIO_SPIFFS = "seguidor";
 const char* ENDERECOS_SPIFFS[4] = {"espera", "Kp", "Ki", "Kd"};
 const float VALORES_PADROES[4] = {10.0, 6.0, 0.2, 20};
 
 // --------------------------------------------------
 // Pagina web principal
-
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -530,7 +529,6 @@ const char index_html[] PROGMEM = R"rawliteral(
         function resetModosAutonomosVisual() {
             led_state.linha = false; led_state.explora = false;
             ['linha', 'explora'].forEach(k => { document.getElementById("btn-led-" + k).classList.remove("on"); document.getElementById("led-status-" + k).innerText = "OFF"; });
-            // Ao iniciar movimentação pelo JoyStick, cancela qualquer missão ativa para o usuário
             if(document.getElementById("waypoint_status").innerText.includes("Iniciando") || document.getElementById("waypoint_status").innerText.includes("Navegando")) {
                 document.getElementById("waypoint_status").innerText = "Status: Cancelado pelo Joystick";
                 document.getElementById("waypoint_status").style.color = "#f44336";
@@ -662,21 +660,7 @@ void setup() {
   linha_escura = SPIFFS.getBool("linha_escura", true);
   SPIFFS.end();
 
-  // BUGFIX "parede virtual": carregar_mapa_salvo() populava occupancyMap[][]
-  // com os obstáculos gravados na sessão ANTERIOR, mas robot_local_x_cm,
-  // robot_local_y_cm e theta_rad sempre reiniciam em 0.0 a cada boot.
-  // Ou seja, o mapa antigo fica ancorado na pose de onde o robô estava
-  // ligado da última vez, e é reinterpretado como se fosse a pose atual.
-  // Se o Scott for ligado em outro lugar/ângulo (o caso normal), as células
-  // marcadas como obstáculo (2) aparecem projetadas à frente do robô mesmo
-  // sem nada ali de verdade — a "antena virtual" acusa uma parede fantasma.
-  // Correção: começar cada sessão com o grid limpo; ele volta a ser
-  // preenchido em tempo real pelos sensores conforme o robô se move.
   memset(occupancyMap, 0, sizeof(occupancyMap));
-  // Se quiser reativar a persistência de mapa entre sessões, é necessário
-  // antes implementar uma etapa de "recalibração de pose" (ex.: usuário
-  // confirma via app que o robô está no mesmo ponto/orientação inicial de
-  // quando o mapa foi salvo) antes de chamar carregar_mapa_salvo().
 }
 
 void loop() {
@@ -1038,60 +1022,75 @@ void segue_linha() {
   delay(espera);
 }
 
+// --------------------------------------------------
+// NOVA FUNÇÃO DO MODO DE EXPLORAÇÃO
+// O Robô dá ré e em seguida sorteia aleatoriamente se irá girar 90 graus para a esquerda ou para a direita
 void explora_casa() {
-  // O obstáculo existe fisicamente na frente OU o mapa avisou que ele existe via Antena Virtual
-  //bool obstaculo_frente = ((distancia > 0) && (distancia <= DISTANCIA_EXPLORACAO)) || obstaculo_virtual_detectado(DISTANCIA_EXPLORACAO);
-  bool obstaculo_frente = ((distancia > 0) && (distancia <= DISTANCIA_EXPLORACAO));
+    bool obstaculo_frente = ((distancia > 0) && (distancia <= DISTANCIA_EXPLORACAO));
+    bool queda_detectada = (analogRead(SENSOR_LINHA_ESQUERDO) > LIMIAR_QUEDA) || (analogRead(SENSOR_LINHA_DIREITO) > LIMIAR_QUEDA);
+    static bool status_queda_ui_explora = false;
 
-  bool queda_detectada = (analogRead(SENSOR_LINHA_ESQUERDO) > LIMIAR_QUEDA) || (analogRead(SENSOR_LINHA_DIREITO) > LIMIAR_QUEDA);
-  static bool status_queda_ui_explora = false;
+    if (estadoExplora == EXPLORA_PARADO) { parar_motores(); return; }
 
-  if (estadoExplora == EXPLORA_PARADO) { parar_motores(); return; }
+    if (estadoExplora != EXPLORA_LIVRE) {
+        if (millis() - tempo_inicio_manobra_explora > TIMEOUT_MAX_EXPLORA) {
+            estadoExplora = EXPLORA_LIVRE; giros_consecutivos = 0; mover_motores(VELOCIDADE_EXPLORACAO, VELOCIDADE_EXPLORACAO); return;
+        }
+        
+        if (estadoExplora == EXPLORA_RE) {
+            if ((contador_esq_A - posicao_inicial_explora) >= alvoPulsosExplora) {
+                parar_motores(); delay(250); 
+                
+                // Sorteia a direção do giro (1 para Esquerda, -1 para Direita)
+                sentido_giro_atual = (random(0, 2) == 0) ? 1 : -1;
+                
+                // Aplica a direção aos motores para um giro no próprio eixo
+                mover_motores(-VELOCIDADE_GIRO * sentido_giro_atual, VELOCIDADE_GIRO * sentido_giro_atual); 
+                
+                estadoExplora = EXPLORA_GIRO; 
+                posicao_inicial_explora = contador_esq_A; 
+                alvoPulsosExplora = PULSOS_90_GRAUS; 
+                tempo_inicio_manobra_explora = millis(); 
+            }
+        } 
+        else if (estadoExplora == EXPLORA_GIRO) {
+            if ((contador_esq_A - posicao_inicial_explora) >= alvoPulsosExplora) {
+                parar_motores(); delay(100); giros_consecutivos++;
 
-  if (estadoExplora != EXPLORA_LIVRE) {
-      if (millis() - tempo_inicio_manobra_explora > TIMEOUT_MAX_EXPLORA) {
-          estadoExplora = EXPLORA_LIVRE; giros_consecutivos = 0; mover_motores(VELOCIDADE_EXPLORACAO, VELOCIDADE_EXPLORACAO); return;
-      }
-      if (estadoExplora == EXPLORA_RE) {
-          if ((contador_esq_A - posicao_inicial_explora) >= alvoPulsosExplora) {
-              parar_motores(); delay(250); mover_motores(VELOCIDADE_GIRO, -VELOCIDADE_GIRO); 
-              estadoExplora = EXPLORA_GIRO; posicao_inicial_explora = contador_esq_A; alvoPulsosExplora = PULSOS_45_GRAUS; tempo_inicio_manobra_explora = millis(); 
-          }
-      } 
-      else if (estadoExplora == EXPLORA_GIRO) {
-          if ((contador_esq_A - posicao_inicial_explora) >= alvoPulsosExplora) {
-              parar_motores(); delay(100); giros_consecutivos++;
+                bool ainda_obstaculo = ((distancia > 0) && (distancia <= DISTANCIA_EXPLORACAO));
+                bool ainda_queda = (analogRead(SENSOR_LINHA_ESQUERDO) > LIMIAR_QUEDA) || (analogRead(SENSOR_LINHA_DIREITO) > LIMIAR_QUEDA);
 
-             // bool ainda_obstaculo = ((distancia > 0) && (distancia <= DISTANCIA_EXPLORACAO)) || obstaculo_virtual_detectado(DISTANCIA_EXPLORACAO);
-              bool ainda_obstaculo = ((distancia > 0) && (distancia <= DISTANCIA_EXPLORACAO));
+                if (ainda_obstaculo || ainda_queda) {
+                    // Prevenção de bloqueio: se girar demais e não sair, ele para.
+                    if (giros_consecutivos >= 8) {
+                        estadoExplora = EXPLORA_PARADO; if (ws.count() > 0) ws.textAll("{\"stuck\":true}"); 
+                    } else {
+                        // Mantém a direção sorteada e tenta girar mais um pouco para se livrar do obstáculo
+                        mover_motores(-VELOCIDADE_GIRO * sentido_giro_atual, VELOCIDADE_GIRO * sentido_giro_atual); 
+                        posicao_inicial_explora = contador_esq_A; 
+                        alvoPulsosExplora = PULSOS_45_GRAUS; 
+                        tempo_inicio_manobra_explora = millis();
+                        if (ainda_queda && !status_queda_ui_explora) { if (ws.count() > 0) ws.textAll("{\"fall\":true}"); status_queda_ui_explora = true; }
+                    }
+                } else {
+                    // Caminho livre, volta a navegar em frente
+                    estadoExplora = EXPLORA_LIVRE; giros_consecutivos = 0;
+                    if (status_queda_ui_explora) { if (ws.count() > 0) ws.textAll("{\"fall\":false}"); status_queda_ui_explora = false; }
+                    mover_motores(VELOCIDADE_EXPLORACAO, VELOCIDADE_EXPLORACAO);
+                }
+            }
+        }
+        return;
+    }
 
-              bool ainda_queda = (analogRead(SENSOR_LINHA_ESQUERDO) > LIMIAR_QUEDA) || (analogRead(SENSOR_LINHA_DIREITO) > LIMIAR_QUEDA);
-
-              if (ainda_obstaculo || ainda_queda) {
-                  if (giros_consecutivos >= 8) {
-                      estadoExplora = EXPLORA_PARADO; if (ws.count() > 0) ws.textAll("{\"stuck\":true}"); 
-                  } else {
-                      mover_motores(VELOCIDADE_GIRO, -VELOCIDADE_GIRO); posicao_inicial_explora = contador_esq_A; alvoPulsosExplora = PULSOS_45_GRAUS; tempo_inicio_manobra_explora = millis();
-                      if (ainda_queda && !status_queda_ui_explora) { if (ws.count() > 0) ws.textAll("{\"fall\":true}"); status_queda_ui_explora = true; }
-                  }
-              } else {
-                  estadoExplora = EXPLORA_LIVRE; giros_consecutivos = 0;
-                  if (status_queda_ui_explora) { if (ws.count() > 0) ws.textAll("{\"fall\":false}"); status_queda_ui_explora = false; }
-                  mover_motores(VELOCIDADE_EXPLORACAO, VELOCIDADE_EXPLORACAO);
-              }
-          }
-      }
-      return;
-  }
-
-  if (queda_detectada || obstaculo_frente) {
-      if (queda_detectada && !status_queda_ui_explora) { if (ws.count() > 0) ws.textAll("{\"fall\":true}"); status_queda_ui_explora = true; }
-      parar_motores(); delay(250); mover_motores(-VELOCIDADE_EXPLORACAO, -VELOCIDADE_EXPLORACAO);
-      estadoExplora = EXPLORA_RE; giros_consecutivos = 0; posicao_inicial_explora = contador_esq_A; alvoPulsosExplora = PULSOS_20_CM; tempo_inicio_manobra_explora = millis();
-  } else {
-      if (status_queda_ui_explora) { if (ws.count() > 0) ws.textAll("{\"fall\":false}"); status_queda_ui_explora = false; }
-      mover_motores(VELOCIDADE_EXPLORACAO, VELOCIDADE_EXPLORACAO);
-  }
+    if (queda_detectada || obstaculo_frente) {
+        if (queda_detectada && !status_queda_ui_explora) { if (ws.count() > 0) ws.textAll("{\"fall\":true}"); status_queda_ui_explora = true; }
+        parar_motores(); delay(250); mover_motores(-VELOCIDADE_EXPLORACAO, -VELOCIDADE_EXPLORACAO);
+        estadoExplora = EXPLORA_RE; giros_consecutivos = 0; posicao_inicial_explora = contador_esq_A; alvoPulsosExplora = PULSOS_20_CM; tempo_inicio_manobra_explora = millis();
+    } else {
+        if (status_queda_ui_explora) { if (ws.count() > 0) ws.textAll("{\"fall\":false}"); status_queda_ui_explora = false; }
+        mover_motores(VELOCIDADE_EXPLORACAO, VELOCIDADE_EXPLORACAO);
+    }
 }
 
 // --------------------------------------------------
