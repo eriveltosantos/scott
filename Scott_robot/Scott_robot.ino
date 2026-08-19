@@ -1156,7 +1156,7 @@ void navega_waypoints() {
   float target_lon = waypoints_lon[waypoint_atual_idx];
 
   //bool obstaculo_frente = wp_evita_colisao && (((distancia > 0) && (distancia <= DISTANCIA_OBSTACULO)) || obstaculo_virtual_detectado(DISTANCIA_OBSTACULO));
-  bool obstaculo_frente = wp_evita_colisao && (((distancia > 0) && (distancia <= DISTANCIA_OBSTACULO));
+  bool obstaculo_frente = wp_evita_colisao && ((distancia > 0) && (distancia <= DISTANCIA_OBSTACULO));
   bool queda_detectada = wp_evita_queda && ((analogRead(SENSOR_LINHA_ESQUERDO) > LIMIAR_QUEDA) || (analogRead(SENSOR_LINHA_DIREITO) > LIMIAR_QUEDA));
 
   if (obstaculo_frente || queda_detectada) {
