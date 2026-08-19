@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Scott Robot - Kit Robo Explorer - Joystick + Linha + Colisão + Exploração + Waypoints GPS + Odometria + Grid Mapping
+* Scott Robot - Kit Robo Explorer - Joystick + Linha + Exploração + Waypoints GPS + Odometria + Grid Mapping
 * Controle o seu Rocket Tank pelo celular ou ative os modos autônomos.
 *******************************************************************************/
 
@@ -152,7 +152,6 @@ const char *ALIAS_KI = "ki";
 const char *ALIAS_KD = "kd";
 const char *ALIAS_PARA = "stop";
 const char *ALIAS_LINHA = "linha";
-const char *ALIAS_COLISAO = "colisao";
 const char *ALIAS_EXPLORA = "explora";
 const char *ALIAS_WAYPOINT = "waypoint";
 
@@ -199,11 +198,7 @@ float espera, Kp = 6, Ki = 0.2, Kd = 20, erro = 0.0, P = 0.0, I = 0.0, D = 0.0, 
 bool parada = true;
 
 bool modo_linha = false;
-bool modo_colisao = false;
 bool modo_explora = false;
-
-int contadorColisoes = 0;
-uint32_t tempoUltimaColisao = 0;
 
 enum EstadoManobra { LIVRE, MANOBRA_QUEDA_RE, MANOBRA_QUEDA_GIRO, MANOBRA_PAREDE_RE, MANOBRA_PAREDE_GIRO };
 EstadoManobra estadoManobraAtual = LIVRE;
@@ -248,11 +243,11 @@ const char index_html[] PROGMEM = R"rawliteral(
         .grid-3x3 { border-collapse: collapse; margin: 0 auto; background: #fff; width: 100%; max-width: 400px; font-size: 13px; }
         .grid-3x3 td { padding: 6px; border: 2px solid #ECE5E5; text-align: center; }
 
-        #btn-led-linha, #btn-led-colisao, #btn-led-explora {
+        #btn-led-linha, #btn-led-explora {
             padding: 16px 20px; font-size: 16px; font-family: inherit; background-color: #444; color: #fff; border: 3px solid #666; border-radius: 10px; cursor: pointer; user-select: none; transition: background-color 0.15s; outline: none; width: 100px;
         }
-        #btn-led-linha.on, #btn-led-colisao.on, #btn-led-explora.on { background-color: #f0be00; border-color: #c49a00; color: #000; font-weight:bold;}
-        #btn-led-linha:disabled, #btn-led-colisao:disabled, #btn-led-explora:disabled { background-color: #eee; border-color: #ccc; color: #999; cursor: not-allowed; }
+        #btn-led-linha.on, #btn-led-explora.on { background-color: #f0be00; border-color: #c49a00; color: #000; font-weight:bold;}
+        #btn-led-linha:disabled, #btn-led-explora:disabled { background-color: #eee; border-color: #ccc; color: #999; cursor: not-allowed; }
 
         .menu { display: flex; background-color: #222; border-bottom: 2px solid #444; height: 40px; }
         .menu-item { flex: 1; text-align: center; line-height: 40px; color: #ccc; font-size: 16px; cursor: pointer; user-select: none; transition: background-color 0.15s, color 0.15s; border-bottom: 3px solid transparent; }
@@ -306,7 +301,6 @@ const char index_html[] PROGMEM = R"rawliteral(
                     <div style="display: flex; width: 100%; justify-content: space-around; align-items: center; margin-top: 15px;">
                         <div style="text-align: center;"><button id="btn-led-linha" onclick="toggleLed('linha')">Line</button><div style="color: gray; margin-top: 5px; font-size: 10px;" id="led-status-linha">OFF</div></div>
                         <div style="text-align: center;"><button id="btn-led-explora" onclick="toggleLed('explora')">Explore</button><div style="color: gray; margin-top: 5px; font-size: 10px;" id="led-status-explora">OFF</div></div>
-                        <div style="text-align: center;"><button id="btn-led-colisao" onclick="toggleLed('colisao')">Collision</button><div style="color: gray; margin-top: 5px; font-size: 10px;" id="led-status-colisao">OFF</div></div>
                     </div>
                     <div id="fall-message-container" style="width: 100%; text-align: center; margin-top: 15px;">
                         <span id="fall-status-text" style="font-size: 18px; font-weight: bold; color: #ccc; transition: color 0.2s;"></span><br>
@@ -479,7 +473,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             if (tab === 'map') checkAndInitMap();
         }
 
-        var led_state = { linha: false, colisao: false, explora: false };
+        var led_state = { linha: false, explora: false };
         function toggleLed(tipo){
             led_state[tipo] = !led_state[tipo];
             if (led_state[tipo]) {
@@ -534,8 +528,8 @@ const char index_html[] PROGMEM = R"rawliteral(
         function in_circle() { return (radius * radius_factor) >= Math.sqrt(Math.pow(coord.x - origin_joystick.x, 2) + Math.pow(coord.y - origin_joystick.y, 2)); }
 
         function resetModosAutonomosVisual() {
-            led_state.linha = false; led_state.colisao = false; led_state.explora = false;
-            ['linha', 'colisao', 'explora'].forEach(k => { document.getElementById("btn-led-" + k).classList.remove("on"); document.getElementById("led-status-" + k).innerText = "OFF"; });
+            led_state.linha = false; led_state.explora = false;
+            ['linha', 'explora'].forEach(k => { document.getElementById("btn-led-" + k).classList.remove("on"); document.getElementById("led-status-" + k).innerText = "OFF"; });
             // Ao iniciar movimentação pelo JoyStick, cancela qualquer missão ativa para o usuário
             if(document.getElementById("waypoint_status").innerText.includes("Iniciando") || document.getElementById("waypoint_status").innerText.includes("Navegando")) {
                 document.getElementById("waypoint_status").innerText = "Status: Cancelado pelo Joystick";
@@ -574,7 +568,6 @@ void atualizar_sensor_ultrassonico(void);
 void onEvent(AsyncWebSocket *, AsyncWebSocketClient *, AwsEventType, void *, uint8_t *, size_t);
 void calcula_PID(void);
 void segue_linha(void);
-void evita_colisao(void);
 void explora_casa(void);
 void navega_waypoints(void);
 void calibrarSensoresLinha(void);
@@ -735,11 +728,10 @@ void loop() {
   }
 
   if (modoSegurancaBateria) {
-      modo_linha = false; modo_colisao = false; modo_explora = false; modo_waypoints = false;
+      modo_linha = false; modo_explora = false; modo_waypoints = false;
       parar_motores();
   } else {
       if (modo_linha) segue_linha();
-      else if (modo_colisao) evita_colisao();
       else if (modo_explora) explora_casa();
       else if (modo_waypoints) navega_waypoints();
   }
@@ -950,9 +942,6 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t length) {
     data[length] = 0;
 
     if (strstr(reinterpret_cast<char *>(data), "calibrate_line") != nullptr) {
-      // BUGFIX: o botão "Calibrate Sensors" envia {"cmd":"calibrate_line"},
-      // mas nenhum ramo deste parser reconhecia essa mensagem — ela caía
-      // no vazio e calibrarSensoresLinha() nunca era chamada.
       calibrarSensoresLinha();
     }
     else if (strstr(reinterpret_cast<char *>(data), ALIAS_WAYPOINT) != nullptr) {
@@ -961,7 +950,7 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t length) {
       if(json.containsKey("wp_colisao")) wp_evita_colisao = json["wp_colisao"].as<bool>();
       modo_waypoints = json[ALIAS_WAYPOINT].as<bool>();
       if (modo_waypoints) {
-          modo_linha = false; modo_colisao = false; modo_explora = false;
+          modo_linha = false; modo_explora = false;
           estadoWay = WAY_LIVRE; heading_gps_valido = false; registrou_inicio_calibracao = false;
           total_waypoints = 0; waypoint_atual_idx = 0; giros_consecutivos_way = 0;
           
@@ -982,23 +971,21 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t length) {
         if(json.containsKey("wp_queda")) wp_evita_queda = json["wp_queda"].as<bool>();
         if(json.containsKey("wp_colisao")) wp_evita_colisao = json["wp_colisao"].as<bool>();
     }
-    else if (strstr(reinterpret_cast<char *>(data), ALIAS_LINHA) != nullptr || strstr(reinterpret_cast<char *>(data), ALIAS_COLISAO) != nullptr || strstr(reinterpret_cast<char *>(data), ALIAS_EXPLORA) != nullptr) {
+    else if (strstr(reinterpret_cast<char *>(data), ALIAS_LINHA) != nullptr || strstr(reinterpret_cast<char *>(data), ALIAS_EXPLORA) != nullptr) {
       JsonDocument json; deserializeJson(json, data, length);
       if (json.containsKey(ALIAS_LINHA)) modo_linha = json[ALIAS_LINHA].as<bool>();
-      if (json.containsKey(ALIAS_COLISAO)) modo_colisao = json[ALIAS_COLISAO].as<bool>();
       if (json.containsKey(ALIAS_EXPLORA)) modo_explora = json[ALIAS_EXPLORA].as<bool>();
       
-      if (modo_linha) { modo_colisao = false; modo_explora = false; modo_waypoints = false; erro = 0.0; I = 0.0; erro_anterior = 0.0; contador_parada = 0; }
-      else if (modo_colisao) { modo_linha = false; modo_explora = false; modo_waypoints = false; }
-      else if (modo_explora) { modo_linha = false; modo_colisao = false; modo_waypoints = false; }
+      if (modo_linha) { modo_explora = false; modo_waypoints = false; erro = 0.0; I = 0.0; erro_anterior = 0.0; contador_parada = 0; }
+      else if (modo_explora) { modo_linha = false; modo_waypoints = false; }
 
-      if (!modo_linha && !modo_colisao && !modo_explora && !modo_waypoints) {
+      if (!modo_linha && !modo_explora && !modo_waypoints) {
         parar_motores(); estadoManobraAtual = LIVRE; estadoExplora = EXPLORA_LIVRE; ws.textAll("{\"fall\":false, \"stuck\":false}"); 
       }
     }
     else if (strstr(reinterpret_cast<char *>(data), ALIAS_VELOCIDADE) != nullptr) {
-      if (modo_linha || modo_colisao || modo_explora || modo_waypoints) {
-        modo_linha = false; modo_colisao = false; modo_explora = false; modo_waypoints = false; total_waypoints = 0;
+      if (modo_linha || modo_explora || modo_waypoints) {
+        modo_linha = false; modo_explora = false; modo_waypoints = false; total_waypoints = 0;
         parar_motores(); estadoManobraAtual = LIVRE; estadoExplora = EXPLORA_LIVRE;
         ws.textAll("{\"fall\":false, \"stuck\":false, \"waypoint_status\":\"Cancelado pelo Joystick\"}"); 
       }
@@ -1049,39 +1036,6 @@ void segue_linha() {
 
   if (contador_parada >= CONTAGEM_MAXIMA) { parar_motores(); P = 0; I = 0; D = 0; contador_parada = CONTAGEM_MAXIMA; }
   delay(espera);
-}
-
-void evita_colisao() {
-  if (estadoManobraAtual != LIVRE) {
-    bool transicao = false;
-    if ((contador_esq_A - posicao_inicial_manobra) >= alvoPulsosManobra) { transicao = true; }
-    if (!transicao) { return; } 
-    else {
-        if (estadoManobraAtual == MANOBRA_QUEDA_RE || estadoManobraAtual == MANOBRA_PAREDE_RE) {
-            parar_motores(); delay(250); mover_motores(VELOCIDADE_GIRO, -VELOCIDADE_GIRO); 
-            estadoManobraAtual = (estadoManobraAtual == MANOBRA_QUEDA_RE) ? MANOBRA_QUEDA_GIRO : MANOBRA_PAREDE_GIRO;
-            posicao_inicial_manobra = contador_esq_A; alvoPulsosManobra = PULSOS_180_GRAUS; return;
-        } else { parar_motores(); delay(100); estadoManobraAtual = LIVRE; if (ws.count() > 0) ws.textAll("{\"fall\":false}"); return; }
-    }
-  }
-
-  int leitura_esq = analogRead(SENSOR_LINHA_ESQUERDO); int leitura_dir = analogRead(SENSOR_LINHA_DIREITO);
-  
-  // O obstáculo existe fisicamente na frente OU o mapa avisou que ele existe via Antena Virtual
-  //bool obstaculo_frente = ((distancia > 0) && (distancia <= DISTANCIA_OBSTACULO)) || obstaculo_virtual_detectado(DISTANCIA_OBSTACULO);
-  bool obstaculo_frente = ((distancia > 0) && (distancia <= DISTANCIA_OBSTACULO));
-  bool queda_detectada = (leitura_esq > LIMIAR_QUEDA) || (leitura_dir > LIMIAR_QUEDA);
-
-  static bool status_queda_ui = false;
-  if (!queda_detectada && status_queda_ui) { if (ws.count() > 0) ws.textAll("{\"fall\":false}"); status_queda_ui = false; }
-
-  if (queda_detectada || obstaculo_frente) {
-      if (queda_detectada && !status_queda_ui) { if (ws.count() > 0) ws.textAll("{\"fall\":true}"); status_queda_ui = true; }
-      parar_motores(); delay(250); mover_motores(-VELOCIDADE, -VELOCIDADE); 
-      estadoManobraAtual = queda_detectada ? MANOBRA_QUEDA_RE : MANOBRA_PAREDE_RE;
-      posicao_inicial_manobra = contador_esq_A; alvoPulsosManobra = queda_detectada ? PULSOS_30_CM : PULSOS_15_CM; 
-      timeout_distancia = millis() + TEMPO_ATUALIZACAO_DISTANCIA;
-  } else { mover_motores(VELOCIDADE, VELOCIDADE); }
 }
 
 void explora_casa() {
@@ -1300,7 +1254,7 @@ void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType 
     case WS_EVT_CONNECT: digitalWrite(PINO_LED, HIGH); break;
     case WS_EVT_DISCONNECT:
         if (ws.count() == 0) {
-          digitalWrite(PINO_LED, LOW); modo_linha = false; modo_colisao = false; modo_explora = false; modo_waypoints = false; parar_motores(); estadoManobraAtual = LIVRE; estadoExplora = EXPLORA_LIVRE; total_waypoints = 0;
+          digitalWrite(PINO_LED, LOW); modo_linha = false; modo_explora = false; modo_waypoints = false; parar_motores(); estadoManobraAtual = LIVRE; estadoExplora = EXPLORA_LIVRE; total_waypoints = 0;
         } break;
     case WS_EVT_DATA: handleWebSocketMessage(arg, data, length); break;
     case WS_EVT_PONG: case WS_EVT_ERROR: break;
@@ -1308,7 +1262,7 @@ void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType 
 }
 
 void calibrarSensoresLinha() {
-    modo_linha = false; modo_colisao = false; modo_explora = false; modo_waypoints = false; parar_motores(); estadoManobraAtual = LIVRE; estadoExplora = EXPLORA_LIVRE; total_waypoints = 0;
+    modo_linha = false; modo_explora = false; modo_waypoints = false; parar_motores(); estadoManobraAtual = LIVRE; estadoExplora = EXPLORA_LIVRE; total_waypoints = 0;
     int leituraInicialLinha = analogRead(SENSOR_LINHA_ESQUERDO); int minVal = 4095; int maxVal = 0; uint32_t inicio = millis();
     
     while (millis() - inicio < 2500) {
@@ -1334,7 +1288,7 @@ void verificarSegurancaBateria() {
         leituras_criticas_consecutivas++;
         if (leituras_criticas_consecutivas >= 3) {
             if (!modoSegurancaBateria) {
-                modoSegurancaBateria = true; modo_linha = false; modo_colisao = false; modo_explora = false; modo_waypoints = false; parar_motores(); estadoManobraAtual = LIVRE; estadoExplora = EXPLORA_LIVRE; total_waypoints = 0;
+                modoSegurancaBateria = true; modo_linha = false; modo_explora = false; modo_waypoints = false; parar_motores(); estadoManobraAtual = LIVRE; estadoExplora = EXPLORA_LIVRE; total_waypoints = 0;
                 if (ws.count() > 0) ws.textAll("{\"alert\":\"LOW_BATTERY\"}");
             }
             digitalWrite(PINO_LED, (millis() / 150) % 2 ? HIGH : LOW);
