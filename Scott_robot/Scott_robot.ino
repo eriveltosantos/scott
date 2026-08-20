@@ -174,6 +174,15 @@ const int SENSOR_LINHA_DIREITO = 39;
 int leitura_esquerdo = 0;
 int leitura_direito = 0;
 
+// --- Leitura filtrada dos sensores de linha (média móvel exponencial p/ reduzir ruído do ADC) ---
+float leitura_esquerda_filtrada = 0.0;
+float leitura_direita_filtrada = 0.0;
+const float ALPHA_FILTRO_LINHA = 0.5; // 0 = sem filtro, 1 = ignora leitura nova (mais suave = mais perto de 0)
+
+// --- Normalização do erro proporcional e controle de tempo (dt) do PID ---
+const float FATOR_NORMALIZACAO_LINHA = 2500.0; // diferença de leitura (ADC) que equivale a erro = 1.0
+unsigned long pid_tempo_anterior = 0;
+
 int limiarLinha = 3000;
 bool linha_escura = true; 
 const int LIMIAR_QUEDA = 3850; 
@@ -192,7 +201,7 @@ const int DISTANCIA_EXPLORACAO = 20;
 const int CONTAGEM_MAXIMA = 150;
 int contador_parada = 0;
 
-float espera, Kp = 6, Ki = 0.2, Kd = 20, erro = 0.0, P = 0.0, I = 0.0, D = 0.0, erro_anterior = 0.0, resposta_PID = 0.0;
+float espera, Kp = 6, Ki = 0.2, Kd = 0.4, erro = 0.0, P = 0.0, I = 0.0, D = 0.0, erro_anterior = 0.0, resposta_PID = 0.0;
 bool parada = true;
 
 bool modo_linha = false;
@@ -214,6 +223,7 @@ const uint32_t TIMEOUT_MAX_EXPLORA = 6000;
 int sentido_giro_atual = 1;
 
 bool modoSegurancaBateria = false;
+uint32_t ultima_tensao_bateria_mv = 0; // exposta p/ debug (atualizada em verificarSegurancaBateria)
 const uint32_t TENSAO_CRITICA = 6400;
 
 Preferences SPIFFS; 
@@ -428,7 +438,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 
         var connection = new WebSocket(`ws://${window.location.hostname}/ws`);
         connection.onopen = function () { console.log('Connection opened'); };
-        connection.onmessage = function (e) {
+connection.onmessage = function (e) {
             const data = JSON.parse(e.data);
             
             if (data["vbat"]) {
@@ -461,6 +471,14 @@ const char index_html[] PROGMEM = R"rawliteral(
             }
             if (data["date"] !== undefined) document.getElementById("gps-date").innerText = data["date"];
             if (data["time"] !== undefined) document.getElementById("gps-time").innerText = data["time"];
+            
+            // --- BLOCO NOVO: Tratamento do retorno da calibração ---
+            if (data["status"] === "calibrado") {
+                let corDetectada = data["escura"] ? "Linha Escura" : "Linha Clara";
+                document.getElementById('statusCalibracao').innerText = "OK! Limiar: " + data["limiar"] + " (" + corDetectada + ")";
+                document.getElementById('statusCalibracao').style.color = "#4CAF50";
+            }
+            // --------------------------------------------------------
         };
 
         function showTab(tab) {
@@ -605,6 +623,11 @@ void parar_motores() {
 
 void setup() {
   Serial.begin(115200);
+  delay(300); // dá tempo do monitor serial conectar antes da primeira mensagem
+  Serial.println("=====================================");
+  Serial.println("FIRMWARE Scott_robot - build debug-v3");
+  Serial.println("(erro proporcional + PID por dt + vbat/segBat/contParada no log)");
+  Serial.println("=====================================");
   
   SerialGPS.setRxBufferSize(1024);
   SerialGPS.begin(9600, SERIAL_8N1, PINO_GPS_RX, PINO_GPS_TX);
@@ -655,7 +678,7 @@ void setup() {
   espera = SPIFFS.getFloat(ENDERECOS_SPIFFS[0], 10);
   Kp = SPIFFS.getFloat(ENDERECOS_SPIFFS[1], 6);
   Ki = SPIFFS.getFloat(ENDERECOS_SPIFFS[2], 0.2);
-  Kd = SPIFFS.getFloat(ENDERECOS_SPIFFS[3], 20);
+  Kd = SPIFFS.getFloat(ENDERECOS_SPIFFS[3], 0.4);
   limiarLinha = SPIFFS.getInt("limiar", 3000); 
   linha_escura = SPIFFS.getBool("linha_escura", true);
   SPIFFS.end();
@@ -960,7 +983,7 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t length) {
       if (json.containsKey(ALIAS_LINHA)) modo_linha = json[ALIAS_LINHA].as<bool>();
       if (json.containsKey(ALIAS_EXPLORA)) modo_explora = json[ALIAS_EXPLORA].as<bool>();
       
-      if (modo_linha) { modo_explora = false; modo_waypoints = false; erro = 0.0; I = 0.0; erro_anterior = 0.0; contador_parada = 0; }
+      if (modo_linha) { modo_explora = false; modo_waypoints = false; erro = 0.0; I = 0.0; erro_anterior = 0.0; contador_parada = 0; leitura_esquerda_filtrada = 0.0; leitura_direita_filtrada = 0.0; pid_tempo_anterior = 0; }
       else if (modo_explora) { modo_linha = false; modo_waypoints = false; }
 
       if (!modo_linha && !modo_explora && !modo_waypoints) {
@@ -1009,19 +1032,76 @@ void atualizar_sensor_ultrassonico(void) {
 }
 
 // --------------------------------------------------
+// --------------------------------------------------
 void segue_linha() {
-  leitura_esquerdo = analogRead(SENSOR_LINHA_ESQUERDO); leitura_direito = analogRead(SENSOR_LINHA_DIREITO);
-  bool ve_esq = (leitura_esquerdo > limiarLinha); bool ve_dir = (leitura_direito > limiarLinha);
+  leitura_esquerdo = analogRead(SENSOR_LINHA_ESQUERDO); 
+  leitura_direito = analogRead(SENSOR_LINHA_DIREITO);
 
-   if(ve_esq && ve_dir) { erro = 0.0; calcula_PID(); mover_motores(velocidade_esquerda, velocidade_direita); contador_parada = 0; }
-  else if(!ve_esq && !ve_dir){ if (erro == 1.0) { erro = 2.0; } else if (erro < 0.0) { erro = -2.0; } calcula_PID(); mover_motores(velocidade_esquerda, velocidade_direita); }
-  else if(ve_dir) { erro = 1.0; calcula_PID(); mover_motores(velocidade_esquerda, velocidade_direita); contador_parada = 0; }
-  else if(ve_esq) { erro = -1.0; calcula_PID(); mover_motores(velocidade_esquerda, velocidade_direita); contador_parada = 0; }
+  // Filtro passa-baixa (média móvel exponencial) para não deixar ruído do ADC,
+  // perto do limiar, virar um "salto" de estado e disparar o derivativo à toa.
+  if (leitura_esquerda_filtrada == 0.0 && leitura_direita_filtrada == 0.0) {
+      leitura_esquerda_filtrada = leitura_esquerdo;
+      leitura_direita_filtrada  = leitura_direito;
+  } else {
+      leitura_esquerda_filtrada = (ALPHA_FILTRO_LINHA * leitura_esquerdo) + ((1.0 - ALPHA_FILTRO_LINHA) * leitura_esquerda_filtrada);
+      leitura_direita_filtrada  = (ALPHA_FILTRO_LINHA * leitura_direito)  + ((1.0 - ALPHA_FILTRO_LINHA) * leitura_direita_filtrada);
+  }
 
-  if (contador_parada >= CONTAGEM_MAXIMA) { parar_motores(); P = 0; I = 0; D = 0; contador_parada = CONTAGEM_MAXIMA; }
+  bool ve_esq, ve_dir;
+
+  // Aplica a polaridade correta descoberta durante a calibração
+  if (linha_escura) {
+      ve_esq = (leitura_esquerda_filtrada > limiarLinha);
+      ve_dir = (leitura_direita_filtrada  > limiarLinha);
+  } else {
+      ve_esq = (leitura_esquerda_filtrada < limiarLinha);
+      ve_dir = (leitura_direita_filtrada  < limiarLinha);
+  }
+
+  // --- ERRO PROPORCIONAL ---
+  // Em vez de degraus fixos (0/±1/±2), o erro agora reflete o QUANTO a linha
+  // está desviada, calculado direto da diferença analógica entre os sensores.
+  // Sinal: positivo = linha mais para a direita (precisa virar à direita).
+  float sinalPolaridade = linha_escura ? 1.0 : -1.0;
+  erro = sinalPolaridade * (leitura_direita_filtrada - leitura_esquerda_filtrada) / FATOR_NORMALIZACAO_LINHA;
+  if (erro > 2.0) erro = 2.0;
+  if (erro < -2.0) erro = -2.0;
+
+  if (!ve_esq && !ve_dir) {
+      // Linha perdida (nenhum sensor vê): mantém o último erro conhecido
+      // (já suavizado pelo filtro acima) em vez de forçar um salto artificial.
+      contador_parada++;
+  } else {
+      contador_parada = 0;
+  }
+
+  calcula_PID();
+  mover_motores(velocidade_esquerda, velocidade_direita);
+
+  // --- DEBUG DE TUNING (remover/comentar depois de ajustar Kp/Ki/Kd) ---
+  // Limitado a ~5x/s para não sobrecarregar a serial nem atrasar o loop.
+  static uint32_t timeout_debug_linha = 0;
+  if (millis() > timeout_debug_linha) {
+      Serial.printf(
+          "esq=%4d dir=%4d | filt_esq=%6.0f filt_dir=%6.0f | erro=%+.2f P=%+.2f I=%+.2f D=%+.2f resp=%+.1f | v_esq=%4d v_dir=%4d | vbat=%4lumV segBat=%d contParada=%d\n",
+          leitura_esquerdo, leitura_direito,
+          leitura_esquerda_filtrada, leitura_direita_filtrada,
+          erro, P, I, D, resposta_PID,
+          velocidade_esquerda, velocidade_direita,
+          (unsigned long)ultima_tensao_bateria_mv, modoSegurancaBateria, contador_parada
+      );
+      timeout_debug_linha = millis() + 200;
+  }
+
+  // Se ficou muito tempo perdido fora da linha, desliga os motores
+  if (contador_parada >= CONTAGEM_MAXIMA) { 
+      parar_motores(); 
+      P = 0; I = 0; D = 0; erro = 0.0; erro_anterior = 0.0;
+      contador_parada = CONTAGEM_MAXIMA; 
+  }
+  
   delay(espera);
 }
-
 // --------------------------------------------------
 // NOVA FUNÇÃO DO MODO DE EXPLORAÇÃO
 // O Robô dá ré e em seguida sorteia aleatoriamente se irá girar 90 graus para a esquerda ou para a direita
@@ -1237,12 +1317,31 @@ void navega_waypoints() {
 
 // --------------------------------------------------
 void calcula_PID() {
-  P = erro; I = I + erro; 
+  // dt real entre chamadas, para I e D terem significado físico (e não dependerem
+  // de quantas vezes por segundo o loop() consegue chamar segue_linha()).
+  unsigned long agora = millis();
+  float dt = (pid_tempo_anterior == 0) ? 0.02 : (agora - pid_tempo_anterior) / 1000.0;
+  if (dt <= 0.0001) dt = 0.0001; // proteção contra divisão por ~zero
+  pid_tempo_anterior = agora;
+
+  P = erro;
+  I = I + (erro * dt);
   if (I > 50) I = 50; else if (I < -50) I = -50;
-  if (erro == 0.0) I = 0; 
-  D = erro - erro_anterior; 
-  resposta_PID = (Kp * P) + (Ki * I) + (Kd * D); 
+  if (fabs(erro) < 0.05) I = 0; // zona morta: robô centralizado zera o acumulado
+
+  D = (erro - erro_anterior) / dt;
+  if (D > 10.0) D = 10.0; else if (D < -10.0) D = -10.0; // evita picos do derivativo com dt muito pequeno
+
+  resposta_PID = (Kp * P) + (Ki * I) + (Kd * D);
   erro_anterior = erro;
+
+  // --- TRAVA DE SEGURANÇA ---
+  // Nunca deixa a resposta do PID ser forte a ponto de inverter o sentido de uma
+  // roda (isso é o que fazia o robô girar sobre o próprio eixo em vez de curvar).
+  const float RESPOSTA_PID_MAX = VELOCIDADE - 5.0;
+  if (resposta_PID > RESPOSTA_PID_MAX) resposta_PID = RESPOSTA_PID_MAX;
+  if (resposta_PID < -RESPOSTA_PID_MAX) resposta_PID = -RESPOSTA_PID_MAX;
+
   velocidade_esquerda = VELOCIDADE + resposta_PID; velocidade_direita =  VELOCIDADE - resposta_PID;
   if (velocidade_esquerda > VELOCIDADE_MAXIMA) velocidade_esquerda = VELOCIDADE_MAXIMA; else if (velocidade_esquerda < VELOCIDADE_MINIMA) velocidade_esquerda = VELOCIDADE_MINIMA;
   if (velocidade_direita > VELOCIDADE_MAXIMA) velocidade_direita = VELOCIDADE_MAXIMA; else if (velocidade_direita < VELOCIDADE_MINIMA) velocidade_direita = VELOCIDADE_MINIMA;
@@ -1260,9 +1359,16 @@ void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType 
   }
 }
 
+
 void calibrarSensoresLinha() {
     modo_linha = false; modo_explora = false; modo_waypoints = false; parar_motores(); estadoManobraAtual = LIVRE; estadoExplora = EXPLORA_LIVRE; total_waypoints = 0;
-    int leituraInicialLinha = analogRead(SENSOR_LINHA_ESQUERDO); int minVal = 4095; int maxVal = 0; uint32_t inicio = millis();
+    
+    // Lê os dois sensores no início (assumindo que o robô está centralizado na fita, lendo o fundo/chão)
+    int leituraEsqInicial = analogRead(SENSOR_LINHA_ESQUERDO);
+    int leituraDirInicial = analogRead(SENSOR_LINHA_DIREITO);
+    int fundoInicial = (leituraEsqInicial + leituraDirInicial) / 2; 
+    
+    int minVal = 4095; int maxVal = 0; uint32_t inicio = millis();
     
     while (millis() - inicio < 2500) {
         if (((millis() - inicio) / 250) % 2 == 0) mover_motores(60, -60); else mover_motores(-60, 60);
@@ -1271,7 +1377,12 @@ void calibrarSensoresLinha() {
         if (leituraEsq > maxVal) maxVal = leituraEsq; if (leituraDir > maxVal) maxVal = leituraDir;
         delay(10);
     }
-    parar_motores(); limiarLinha = (minVal + maxVal) / 2; linha_escura = (leituraInicialLinha > limiarLinha);
+    parar_motores(); 
+    limiarLinha = (minVal + maxVal) / 2; 
+    
+    // Se a média da cor do chão é menor que o limiar (ex: branco reflete mais IR), a linha procurada é a escura
+    linha_escura = (fundoInicial < limiarLinha);
+    
     SPIFFS.begin(DIRETORIO_SPIFFS, false); SPIFFS.putInt("limiar", limiarLinha); SPIFFS.putBool("linha_escura", linha_escura); SPIFFS.end();
     
     JsonDocument json; json["status"] = "calibrado"; json["limiar"] = limiarLinha; json["escura"] = linha_escura;
@@ -1281,6 +1392,7 @@ void calibrarSensoresLinha() {
 
 void verificarSegurancaBateria() {
     uint32_t tensao_mv = vbat.readVoltage();
+    ultima_tensao_bateria_mv = tensao_mv;
     static uint8_t leituras_criticas_consecutivas = 0;
     
     if (tensao_mv < TENSAO_CRITICA && tensao_mv > 3000) {
