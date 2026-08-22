@@ -201,7 +201,7 @@ const int DISTANCIA_EXPLORACAO = 20;
 const int CONTAGEM_MAXIMA = 150;
 int contador_parada = 0;
 
-float espera, Kp = 6, Ki = 0.2, Kd = 0.4, erro = 0.0, P = 0.0, I = 0.0, D = 0.0, erro_anterior = 0.0, resposta_PID = 0.0;
+float espera, Kp = 40, Ki = 0.2, Kd = 0.4, erro = 0.0, P = 0.0, I = 0.0, D = 0.0, erro_anterior = 0.0, resposta_PID = 0.0;
 bool parada = true;
 
 bool modo_linha = false;
@@ -625,7 +625,7 @@ void setup() {
   Serial.begin(115200);
   delay(300); // dá tempo do monitor serial conectar antes da primeira mensagem
   Serial.println("=====================================");
-  Serial.println("FIRMWARE Scott_robot - build debug-v3");
+  Serial.println("FIRMWARE Scott_robot - build debug-v5 (contador_parada por erro, nao mais por sensor absoluto)");
   Serial.println("(erro proporcional + PID por dt + vbat/segBat/contParada no log)");
   Serial.println("=====================================");
   
@@ -676,7 +676,8 @@ void setup() {
 
   SPIFFS.begin(DIRETORIO_SPIFFS, false);
   espera = SPIFFS.getFloat(ENDERECOS_SPIFFS[0], 10);
-  Kp = SPIFFS.getFloat(ENDERECOS_SPIFFS[1], 6);
+ // Kp = SPIFFS.getFloat(ENDERECOS_SPIFFS[1], 40);
+  Kp = 40.0; 
   Ki = SPIFFS.getFloat(ENDERECOS_SPIFFS[2], 0.2);
   Kd = SPIFFS.getFloat(ENDERECOS_SPIFFS[3], 0.4);
   limiarLinha = SPIFFS.getInt("limiar", 3000); 
@@ -741,6 +742,20 @@ void loop() {
       if (modo_linha) segue_linha();
       else if (modo_explora) explora_casa();
       else if (modo_waypoints) navega_waypoints();
+  }
+
+  // --- STATUS GERAL (sempre roda, independente do modo) ---
+  // Existe pra diagnosticar quando segue_linha() nem chega a ser chamado
+  // (ex.: preso em modoSegurancaBateria mesmo com o app mostrando "Linha" ativa).
+  static uint32_t timeout_debug_status = 0;
+  if (millis() > timeout_debug_status) {
+      Serial.printf(
+          "[STATUS] modo_linha=%d modo_explora=%d modo_waypoints=%d | modoSegurancaBateria=%d vbat=%4lumV | contador_parada=%d\n",
+          modo_linha, modo_explora, modo_waypoints,
+          modoSegurancaBateria, (unsigned long)ultima_tensao_bateria_mv,
+          contador_parada
+      );
+      timeout_debug_status = millis() + 500;
   }
 
   if (millis() > timeout_vbat) {
@@ -1047,36 +1062,41 @@ void segue_linha() {
       leitura_direita_filtrada  = (ALPHA_FILTRO_LINHA * leitura_direito)  + ((1.0 - ALPHA_FILTRO_LINHA) * leitura_direita_filtrada);
   }
 
-  bool ve_esq, ve_dir;
-
-  // Aplica a polaridade correta descoberta durante a calibração
-  if (linha_escura) {
-      ve_esq = (leitura_esquerda_filtrada > limiarLinha);
-      ve_dir = (leitura_direita_filtrada  > limiarLinha);
-  } else {
-      ve_esq = (leitura_esquerda_filtrada < limiarLinha);
-      ve_dir = (leitura_direita_filtrada  < limiarLinha);
-  }
-
   // --- ERRO PROPORCIONAL ---
   // Em vez de degraus fixos (0/±1/±2), o erro agora reflete o QUANTO a linha
   // está desviada, calculado direto da diferença analógica entre os sensores.
   // Sinal: positivo = linha mais para a direita (precisa virar à direita).
+  // IMPORTANTE: por ser uma DIFERENÇA entre os dois sensores, esse erro é
+  // imune a uma queda de leitura que afete os dois sensores igualmente
+  // (ex.: alimentação caindo um pouco sob carga dos motores) — só reage
+  // quando os sensores discordam entre si, que é o que realmente importa.
   float sinalPolaridade = linha_escura ? 1.0 : -1.0;
   erro = sinalPolaridade * (leitura_direita_filtrada - leitura_esquerda_filtrada) / FATOR_NORMALIZACAO_LINHA;
   if (erro > 2.0) erro = 2.0;
   if (erro < -2.0) erro = -2.0;
 
-  if (!ve_esq && !ve_dir) {
-      // Linha perdida (nenhum sensor vê): mantém o último erro conhecido
-      // (já suavizado pelo filtro acima) em vez de forçar um salto artificial.
+  // --- DETECÇÃO DE LINHA PERDIDA ---
+  // Antes isso usava um limiar absoluto por sensor (ve_esq/ve_dir), que travava
+  // em falso-positivo quando os DOIS sensores caíam juntos (mesmo com o erro
+  // relativo entre eles continuando pequeno). Agora usa a saturação do erro
+  // proporcional, que só dispara quando a linha realmente está descentralizada.
+  if (fabs(erro) >= 1.9) {
       contador_parada++;
   } else {
       contador_parada = 0;
   }
 
-  calcula_PID();
-  mover_motores(velocidade_esquerda, velocidade_direita);
+  if (contador_parada >= CONTAGEM_MAXIMA) {
+      // Ficou tempo demais com a linha genuinamente perdida: para e zera o PID.
+      // Isso roda ANTES de calcular/mandar velocidade, então não fica mais
+      // mandando "anda" e "para" no mesmo loop.
+      parar_motores();
+      P = 0; I = 0; D = 0; erro = 0.0; erro_anterior = 0.0;
+      contador_parada = CONTAGEM_MAXIMA;
+  } else {
+      calcula_PID();
+      mover_motores(velocidade_esquerda, velocidade_direita);
+  }
 
   // --- DEBUG DE TUNING (remover/comentar depois de ajustar Kp/Ki/Kd) ---
   // Limitado a ~5x/s para não sobrecarregar a serial nem atrasar o loop.
@@ -1093,13 +1113,6 @@ void segue_linha() {
       timeout_debug_linha = millis() + 200;
   }
 
-  // Se ficou muito tempo perdido fora da linha, desliga os motores
-  if (contador_parada >= CONTAGEM_MAXIMA) { 
-      parar_motores(); 
-      P = 0; I = 0; D = 0; erro = 0.0; erro_anterior = 0.0;
-      contador_parada = CONTAGEM_MAXIMA; 
-  }
-  
   delay(espera);
 }
 // --------------------------------------------------
