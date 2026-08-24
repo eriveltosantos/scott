@@ -107,13 +107,15 @@ bool obstaculo_virtual_detectado(float distancia_projecao_cm) {
     return false;
 }
 
-// ALVOS DE PULSOS PARA MANOBRAS
+// ALVOS DE PULSOS PARA MANOBRAS (usados nos deslocamentos retos, ex. PULSOS_20_CM no reposicionamento em ré)
+// Os alvos de GIRO em graus (antigos PULSOS_45_GRAUS/90/180, removidos) foram
+// substituídos em explora_casa() por um alvo de ROTAÇÃO MEDIDA (theta_rad, ver
+// alvoAnguloGiroRad), já que contar pulsos de uma roda só presumia as duas
+// esteiras girando em sincronia, o que não é verdade quando uma delas
+// patina/derrapa parada durante o giro.
 const uint32_t PULSOS_30_CM = 100;  
 const uint32_t PULSOS_20_CM = 67;  
 const uint32_t PULSOS_15_CM = 50;  
-const uint32_t PULSOS_180_GRAUS = 260; 
-const uint32_t PULSOS_90_GRAUS = 130;  
-const uint32_t PULSOS_45_GRAUS = 65;   
 
 // MAPEAMENTO E VARIÁVEIS DOS ENCODERS
 const int PINO_ENC_ESQ_A = 21; 
@@ -221,6 +223,24 @@ uint32_t alvoPulsosExplora = 0;
 uint32_t tempo_inicio_manobra_explora = 0; 
 const uint32_t TIMEOUT_MAX_EXPLORA = 6000;  
 int sentido_giro_atual = 1;
+const int MAX_GIROS_CONSECUTIVOS = 3;
+
+// --- GIRO POR ODOMETRIA (usa os DOIS encoders, não só o esquerdo) ---
+// theta_rad já é atualizado em atualizar_odometria_fusao() a partir da
+// DIFERENÇA entre os pulsos esquerdo e direito — é uma medida melhor de
+// quanto o robô realmente girou do que contar pulsos de uma roda só,
+// porque não assume que as duas esteiras avançam na mesma proporção.
+float giro_acumulado_rad = 0.0;
+float alvoAnguloGiroRad = 0.0;
+
+// --- DETECÇÃO DE ESTEIRA PATINANDO (SKID) DURANTE O GIRO ---
+unsigned long posicao_inicial_dir_explora = 0;
+unsigned long ultimo_check_stall_ms = 0;
+unsigned long ultima_contagem_esq_stall = 0;
+unsigned long ultima_contagem_dir_stall = 0;
+const uint32_t INTERVALO_CHECK_STALL_MS = 200;
+const uint32_t PULSOS_MINIMOS_NAO_TRAVADO = 2;
+const uint32_t DURACAO_KICK_ANTISTALL_MS = 150;
 
 bool modoSegurancaBateria = false;
 uint32_t ultima_tensao_bateria_mv = 0; // exposta p/ debug (atualizada em verificarSegurancaBateria)
@@ -478,6 +498,13 @@ connection.onmessage = function (e) {
                 document.getElementById('statusCalibracao').innerText = "OK! Limiar: " + data["limiar"] + " (" + corDetectada + ")";
                 document.getElementById('statusCalibracao').style.color = "#4CAF50";
             }
+            if (data["status"] === "calibracao_falhou") {
+                let motivoTexto = (data["motivo"] === "fundo_ambiguo")
+                    ? "leitura inicial ambigua"
+                    : "contraste insuficiente";
+                document.getElementById('statusCalibracao').innerText = "Calibration rejected! (" + motivoTexto + ") Posicione o robo sobre a fita e tente de novo.";
+                document.getElementById('statusCalibracao').style.color = "#e53935";
+            }
             // --------------------------------------------------------
         };
 
@@ -684,6 +711,8 @@ void setup() {
   linha_escura = SPIFFS.getBool("linha_escura", true);
   SPIFFS.end();
 
+  Serial.printf("[BOOT] Calibracao de linha carregada: limiar=%d linha_escura=%d\n", limiarLinha, linha_escura);
+
   memset(occupancyMap, 0, sizeof(occupancyMap));
 }
 
@@ -750,10 +779,10 @@ void loop() {
   static uint32_t timeout_debug_status = 0;
   if (millis() > timeout_debug_status) {
       Serial.printf(
-          "[STATUS] modo_linha=%d modo_explora=%d modo_waypoints=%d | modoSegurancaBateria=%d vbat=%4lumV | contador_parada=%d\n",
+          "[STATUS] modo_linha=%d modo_explora=%d modo_waypoints=%d | modoSegurancaBateria=%d vbat=%4lumV | contador_parada=%d | pulsos_brutos_esq=%lu pulsos_brutos_dir=%lu\n",
           modo_linha, modo_explora, modo_waypoints,
           modoSegurancaBateria, (unsigned long)ultima_tensao_bateria_mv,
-          contador_parada
+          contador_parada, (unsigned long)contador_esq_A, (unsigned long)contador_dir_A
       );
       timeout_debug_status = millis() + 500;
   }
@@ -895,6 +924,14 @@ void atualizar_odometria_fusao() {
     
     float delta_theta = (dist_esq - dist_dir) / LARGURA_ESTEIRA_EFETIVA;
     theta_rad += delta_theta;
+    
+    // Acumulador de rotação SEM wraparound, usado por explora_casa() para medir
+    // o giro em andamento. theta_rad (abaixo) é mantido "enrolado" em [0, 2π) —
+    // ótimo para heading absoluto, mas ruim para medir "quanto girei desde que
+    // comecei este giro" quando um único salto (ex.: depois de um kick
+    // anti-derrapagem bloqueante) pode passar de 180°. Somando o delta bruto
+    // aqui, giro nenhum fica escondido, não importa o tamanho do salto.
+    giro_acumulado_rad += delta_theta;
     
     while (theta_rad >= TWO_PI) theta_rad -= TWO_PI; while (theta_rad < 0) theta_rad += TWO_PI;
     
@@ -1076,11 +1113,24 @@ void segue_linha() {
   if (erro < -2.0) erro = -2.0;
 
   // --- DETECÇÃO DE LINHA PERDIDA ---
-  // Antes isso usava um limiar absoluto por sensor (ve_esq/ve_dir), que travava
-  // em falso-positivo quando os DOIS sensores caíam juntos (mesmo com o erro
-  // relativo entre eles continuando pequeno). Agora usa a saturação do erro
-  // proporcional, que só dispara quando a linha realmente está descentralizada.
-  if (fabs(erro) >= 1.9) {
+  // O erro proporcional (diferença ENTRE os sensores) satura quando a linha
+  // está claramente descentralizada, mas fica cego a um caso: os DOIS
+  // sensores saindo da fita ao mesmo tempo, lendo valores parecidos entre si
+  // (erro ~0) sem que nenhum deles esteja de fato sobre a fita. Por isso,
+  // além da saturação do erro relativo, checamos também se AMBOS os
+  // sensores estão do lado "fundo" (fora da fita) do limiar absoluto.
+  bool erro_saturado = (fabs(erro) >= 1.9);
+  // "Fora da fita" = os dois sensores lendo o valor de FUNDO (piso), não de linha.
+  // Se linha_escura=true, a fita é o extremo ALTO e o piso é o BAIXO -> fora da
+  // fita = os dois ABAIXO do limiar. Se linha_escura=false (seu caso: piso alto,
+  // fita baixa), fora da fita = os dois ACIMA do limiar. (Corrigido: a versão
+  // anterior tinha os dois ramos trocados, fazendo o robô se achar "fora da
+  // fita" bem no meio do seguimento normal.)
+  bool ambos_fora_da_fita = linha_escura
+      ? (leitura_esquerda_filtrada < limiarLinha && leitura_direita_filtrada < limiarLinha)
+      : (leitura_esquerda_filtrada > limiarLinha && leitura_direita_filtrada > limiarLinha);
+
+  if (erro_saturado || ambos_fora_da_fita) {
       contador_parada++;
   } else {
       contador_parada = 0;
@@ -1093,6 +1143,16 @@ void segue_linha() {
       parar_motores();
       P = 0; I = 0; D = 0; erro = 0.0; erro_anterior = 0.0;
       contador_parada = CONTAGEM_MAXIMA;
+  } else if (ambos_fora_da_fita) {
+      // Nenhum sensor está de fato sobre a fita agora — a diferença calculada
+      // em "erro" não reflete a posição da linha, é só descasamento/ruído entre
+      // os dois canais do ADC enquanto ambos enxergam apenas o piso. Alimentar
+      // isso no PID gera giros que não têm relação com onde a fita realmente
+      // está (é o que fazia o robô virar sozinho antes mesmo de detectar a
+      // fita pela primeira vez). Enquanto estiver assim, anda reto e preserva
+      // o estado do PID (P/I/D/erro_anterior) intacto, para retomar suave
+      // quando a fita reaparecer sob um dos sensores.
+      mover_motores(VELOCIDADE, VELOCIDADE);
   } else {
       calcula_PID();
       mover_motores(velocidade_esquerda, velocidade_direita);
@@ -1127,27 +1187,163 @@ void explora_casa() {
 
     if (estadoExplora != EXPLORA_LIVRE) {
         if (millis() - tempo_inicio_manobra_explora > TIMEOUT_MAX_EXPLORA) {
-            estadoExplora = EXPLORA_LIVRE; giros_consecutivos = 0; mover_motores(VELOCIDADE_EXPLORACAO, VELOCIDADE_EXPLORACAO); return;
+            // Segmento (ré ou giro) não terminou dentro do prazo. Trata isso
+            // como uma TENTATIVA FALHA, sujeita ao MESMO limite de tentativas
+            // (MAX_GIROS_CONSECUTIVOS) usado quando o giro termina mas o
+            // obstáculo continua lá. Antes, um timeout resetava
+            // giros_consecutivos = 0 e voltava pra EXPLORA_LIVRE — como o
+            // sensor de obstáculo tende a continuar "bloqueado" logo em
+            // seguida (o giro não tinha terminado de verdade), isso reiniciava
+            // ré+giro do zero indefinidamente, e cada tentativa nova podia
+            // gastar até TIMEOUT_MAX_EXPLORA girando — several reinícios somam
+            // várias voltas completas, mesmo com o teto de 180° por episódio.
+            parar_motores(); delay(100); giros_consecutivos++;
+
+            if (giros_consecutivos >= MAX_GIROS_CONSECUTIVOS || estadoExplora == EXPLORA_RE) {
+                // Limite de tentativas estourado, OU travou tentando dar ré
+                // (sem uma estratégia melhor de recuperação pra isso) -
+                // mais seguro parar e sinalizar do que insistir sem fim.
+                estadoExplora = EXPLORA_PARADO; if (ws.count() > 0) ws.textAll("{\"stuck\":true}");
+            } else {
+                // Ainda dentro do limite de tentativas: continua girando na
+                // mesma direção sorteada, com um novo alvo (45°) e prazo frescos.
+                mover_motores(-VELOCIDADE_MAXIMA * sentido_giro_atual, VELOCIDADE_MAXIMA * sentido_giro_atual);
+                delay(DURACAO_KICK_ANTISTALL_MS);
+                mover_motores(-VELOCIDADE_GIRO * sentido_giro_atual, VELOCIDADE_GIRO * sentido_giro_atual);
+                posicao_inicial_explora = contador_esq_A;
+                posicao_inicial_dir_explora = contador_dir_A;
+                giro_acumulado_rad = 0.0;
+                alvoAnguloGiroRad = PI / 4.0;
+                tempo_inicio_manobra_explora = millis();
+                ultimo_check_stall_ms = millis();
+                ultima_contagem_esq_stall = contador_esq_A;
+                ultima_contagem_dir_stall = contador_dir_A;
+            }
+            return;
         }
         
         if (estadoExplora == EXPLORA_RE) {
-            if ((contador_esq_A - posicao_inicial_explora) >= alvoPulsosExplora) {
+            // --- VIGIA ANTI-DERRAPAGEM (mesma ideia usada no giro) ---
+            // Também dando ré, uma esteira pode ficar presa (atrito estático)
+            // enquanto a outra se move sozinha — o mesmo sintoma relatado para
+            // o giro, só que em linha reta. Sem essa checagem o robô podia
+            // "achar" que andou 20cm de ré usando só o encoder esquerdo,
+            // mesmo com o direito parado (ou vice-versa).
+            if (millis() - ultimo_check_stall_ms >= INTERVALO_CHECK_STALL_MS) {
+                unsigned long delta_esq_stall = contador_esq_A - ultima_contagem_esq_stall;
+                unsigned long delta_dir_stall = contador_dir_A - ultima_contagem_dir_stall;
+                ultima_contagem_esq_stall = contador_esq_A;
+                ultima_contagem_dir_stall = contador_dir_A;
+                ultimo_check_stall_ms = millis();
+
+                if (delta_esq_stall < PULSOS_MINIMOS_NAO_TRAVADO || delta_dir_stall < PULSOS_MINIMOS_NAO_TRAVADO) {
+                    if (ws.count() > 0) ws.textAll("{\"aviso\":\"esteira patinando na re, reforcando torque\"}");
+                    mover_motores(-VELOCIDADE_MAXIMA, -VELOCIDADE_MAXIMA);
+                    delay(DURACAO_KICK_ANTISTALL_MS);
+                    mover_motores(-VELOCIDADE_EXPLORACAO, -VELOCIDADE_EXPLORACAO);
+                }
+            }
+
+            // --- CONCLUSÃO DA RÉ PELA MÉDIA DOS DOIS ENCODERS ---
+            // Antes usava só contador_esq_A, presumindo as duas esteiras andando
+            // em sincronia — a mesma suposição frágil que causava giros
+            // incompletos. A média dos dois é a estimativa correta de quanto o
+            // CENTRO do robô andou, mesmo que uma esteira tenha avançado mais
+            // que a outra.
+            long delta_esq_re = (long)(contador_esq_A - posicao_inicial_explora);
+            long delta_dir_re = (long)(contador_dir_A - posicao_inicial_dir_explora);
+            float pulsos_percorridos_re = (fabs((float)delta_esq_re) + fabs((float)delta_dir_re)) / 2.0;
+
+            if (pulsos_percorridos_re >= alvoPulsosExplora) {
                 parar_motores(); delay(250); 
                 
                 // Sorteia a direção do giro (1 para Esquerda, -1 para Direita)
                 sentido_giro_atual = (random(0, 2) == 0) ? 1 : -1;
                 
-                // Aplica a direção aos motores para um giro no próprio eixo
+                // "Kickstart": um pulso curto em potência máxima antes de assentar
+                // na velocidade normal de giro. Partindo do zero, o atrito estático
+                // (stiction) de uma esteira pode ser maior que o da outra — com os
+                // dois lados na mesma potência "de cruzeiro", às vezes só a esteira
+                // com menos atrito solta e gira, e a outra fica presa derrapando no
+                // lugar (a causa provável do robô não completar o giro pedido).
+                // O pulso de potência máxima ajuda a vencer esse atrito nos dois
+                // lados antes de reduzir para a velocidade de giro sustentada.
+                mover_motores(-VELOCIDADE_MAXIMA * sentido_giro_atual, VELOCIDADE_MAXIMA * sentido_giro_atual);
+                delay(DURACAO_KICK_ANTISTALL_MS);
                 mover_motores(-VELOCIDADE_GIRO * sentido_giro_atual, VELOCIDADE_GIRO * sentido_giro_atual); 
                 
                 estadoExplora = EXPLORA_GIRO; 
                 posicao_inicial_explora = contador_esq_A; 
-                alvoPulsosExplora = PULSOS_90_GRAUS; 
+                posicao_inicial_dir_explora = contador_dir_A;
+                giro_acumulado_rad = 0.0;
+                alvoAnguloGiroRad = PI / 2.0; // 90 graus
                 tempo_inicio_manobra_explora = millis(); 
+                ultimo_check_stall_ms = millis();
+                ultima_contagem_esq_stall = contador_esq_A;
+                ultima_contagem_dir_stall = contador_dir_A;
+                Serial.printf("[GIRO] INICIO episodio: alvo=90 graus | sentido=%d | CM_POR_PULSO=%.4f LARGURA_ESTEIRA_EFETIVA=%.3f\n",
+                              sentido_giro_atual, CM_POR_PULSO, LARGURA_ESTEIRA_EFETIVA);
             }
         } 
         else if (estadoExplora == EXPLORA_GIRO) {
-            if ((contador_esq_A - posicao_inicial_explora) >= alvoPulsosExplora) {
+
+            // --- VIGIA ANTI-DERRAPAGEM ---
+            // Se uma das esteiras não acumulou pulsos suficientes num intervalo
+            // curto enquanto a outra girou normalmente, essa esteira está
+            // patinando parada em vez de girar — exatamente o sintoma relatado
+            // ("às vezes ele só movimenta um dos motores"). Detectado isso,
+            // aplica-se um novo empurrão de potência máxima pra tentar destravá-la.
+            if (millis() - ultimo_check_stall_ms >= INTERVALO_CHECK_STALL_MS) {
+                unsigned long delta_esq_stall = contador_esq_A - ultima_contagem_esq_stall;
+                unsigned long delta_dir_stall = contador_dir_A - ultima_contagem_dir_stall;
+                ultima_contagem_esq_stall = contador_esq_A;
+                ultima_contagem_dir_stall = contador_dir_A;
+                ultimo_check_stall_ms = millis();
+
+                if (delta_esq_stall < PULSOS_MINIMOS_NAO_TRAVADO || delta_dir_stall < PULSOS_MINIMOS_NAO_TRAVADO) {
+                    if (ws.count() > 0) ws.textAll("{\"aviso\":\"esteira patinando no giro, reforcando torque\"}");
+                    Serial.printf("[GIRO][KICK] esteira patinando (delta_esq=%lu delta_dir=%lu em %lums) - reforcando torque. giro_acumulado=%.1f graus\n",
+                                  delta_esq_stall, delta_dir_stall, INTERVALO_CHECK_STALL_MS, giro_acumulado_rad * 180.0 / PI);
+                    mover_motores(-VELOCIDADE_MAXIMA * sentido_giro_atual, VELOCIDADE_MAXIMA * sentido_giro_atual);
+                    delay(DURACAO_KICK_ANTISTALL_MS);
+                    mover_motores(-VELOCIDADE_GIRO * sentido_giro_atual, VELOCIDADE_GIRO * sentido_giro_atual);
+                }
+            }
+
+            // --- DEBUG: progresso do giro em graus, ~5x/s ---
+            // Pulsos brutos de cada encoder desde o início DESTE segmento, e a
+            // conversão giro_acumulado_rad->graus, lado a lado. Serve pra
+            // calibrar LARGURA_ESTEIRA_EFETIVA/CM_POR_PULSO com dados reais:
+            // meça o giro físico de fato (ex. com um transferidor) e compare
+            // com "acumulado" no momento em que o robô parar.
+            static uint32_t timeout_debug_giro = 0;
+            if (millis() > timeout_debug_giro) {
+                long delta_esq_dbg = (long)(contador_esq_A - posicao_inicial_explora);
+                long delta_dir_dbg = (long)(contador_dir_A - posicao_inicial_dir_explora);
+                Serial.printf("[GIRO] acumulado=%.1f graus | alvo=%.1f graus | pulsos_esq=%ld pulsos_dir=%ld | sentido=%d | t_segmento=%lums\n",
+                              giro_acumulado_rad * 180.0 / PI, alvoAnguloGiroRad * 180.0 / PI,
+                              delta_esq_dbg, delta_dir_dbg, sentido_giro_atual,
+                              millis() - tempo_inicio_manobra_explora);
+                timeout_debug_giro = millis() + 200;
+            }
+
+            // --- CONCLUSÃO DO GIRO PELO HEADING MEDIDO (theta_rad), NÃO POR PULSO DE UMA RODA SÓ ---
+            // theta_rad é atualizado a partir da diferença entre os DOIS encoders
+            // (ver atualizar_odometria_fusao), então já reflete corretamente o
+            // quanto o robô girou de fato — mesmo que uma esteira tenha girado
+            // mais que a outra durante a manobra.
+            // giro_acumulado_rad soma o delta bruto a cada atualização de
+            // odometria (ver atualizar_odometria_fusao) e é zerado no início
+            // deste segmento — sem wraparound, então nenhuma volta inteira
+            // escondida dentro de um kick anti-derrapagem passa despercebida.
+            float girado_rad = fabs(giro_acumulado_rad);
+
+            if (girado_rad >= alvoAnguloGiroRad) {
+                Serial.printf("[GIRO] SEGMENTO CONCLUIDO: acumulado=%.1f graus (alvo era %.1f) | pulsos_esq=%ld pulsos_dir=%ld | t_segmento=%lums\n",
+                              girado_rad * 180.0 / PI, alvoAnguloGiroRad * 180.0 / PI,
+                              (long)(contador_esq_A - posicao_inicial_explora),
+                              (long)(contador_dir_A - posicao_inicial_dir_explora),
+                              millis() - tempo_inicio_manobra_explora);
                 parar_motores(); delay(100); giros_consecutivos++;
 
                 bool ainda_obstaculo = ((distancia > 0) && (distancia <= DISTANCIA_EXPLORACAO));
@@ -1155,14 +1351,25 @@ void explora_casa() {
 
                 if (ainda_obstaculo || ainda_queda) {
                     // Prevenção de bloqueio: se girar demais e não sair, ele para.
-                    if (giros_consecutivos >= 8) {
+                    // Total de rotação até desistir = 90° (1ª tentativa) + 45° por
+                    // tentativa adicional. Com MAX_GIROS_CONSECUTIVOS=3, o teto é
+                    // 90+45+45=180° — no máximo meia-volta — em vez das 405° (mais
+                    // de uma volta completa) que o limite antigo de 8 permitia.
+                    if (giros_consecutivos >= MAX_GIROS_CONSECUTIVOS) {
                         estadoExplora = EXPLORA_PARADO; if (ws.count() > 0) ws.textAll("{\"stuck\":true}"); 
                     } else {
                         // Mantém a direção sorteada e tenta girar mais um pouco para se livrar do obstáculo
+                        mover_motores(-VELOCIDADE_MAXIMA * sentido_giro_atual, VELOCIDADE_MAXIMA * sentido_giro_atual);
+                        delay(DURACAO_KICK_ANTISTALL_MS);
                         mover_motores(-VELOCIDADE_GIRO * sentido_giro_atual, VELOCIDADE_GIRO * sentido_giro_atual); 
                         posicao_inicial_explora = contador_esq_A; 
-                        alvoPulsosExplora = PULSOS_45_GRAUS; 
+                        posicao_inicial_dir_explora = contador_dir_A;
+                        giro_acumulado_rad = 0.0;
+                        alvoAnguloGiroRad = PI / 4.0; // 45 graus
                         tempo_inicio_manobra_explora = millis();
+                        ultimo_check_stall_ms = millis();
+                        ultima_contagem_esq_stall = contador_esq_A;
+                        ultima_contagem_dir_stall = contador_dir_A;
                         if (ainda_queda && !status_queda_ui_explora) { if (ws.count() > 0) ws.textAll("{\"fall\":true}"); status_queda_ui_explora = true; }
                     }
                 } else {
@@ -1179,7 +1386,13 @@ void explora_casa() {
     if (queda_detectada || obstaculo_frente) {
         if (queda_detectada && !status_queda_ui_explora) { if (ws.count() > 0) ws.textAll("{\"fall\":true}"); status_queda_ui_explora = true; }
         parar_motores(); delay(250); mover_motores(-VELOCIDADE_EXPLORACAO, -VELOCIDADE_EXPLORACAO);
-        estadoExplora = EXPLORA_RE; giros_consecutivos = 0; posicao_inicial_explora = contador_esq_A; alvoPulsosExplora = PULSOS_20_CM; tempo_inicio_manobra_explora = millis();
+        estadoExplora = EXPLORA_RE; giros_consecutivos = 0;
+        posicao_inicial_explora = contador_esq_A;
+        posicao_inicial_dir_explora = contador_dir_A;
+        alvoPulsosExplora = PULSOS_20_CM; tempo_inicio_manobra_explora = millis();
+        ultimo_check_stall_ms = millis();
+        ultima_contagem_esq_stall = contador_esq_A;
+        ultima_contagem_dir_stall = contador_dir_A;
     } else {
         if (status_queda_ui_explora) { if (ws.count() > 0) ws.textAll("{\"fall\":false}"); status_queda_ui_explora = false; }
         mover_motores(VELOCIDADE_EXPLORACAO, VELOCIDADE_EXPLORACAO);
@@ -1373,16 +1586,26 @@ void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType 
 }
 
 
+// Span mínimo entre o valor mais claro e o mais escuro vistos durante o giro
+// de calibração. Abaixo disso, a roleta de leitura não cruzou de fato a fita
+// (ex.: calibração feita inteira sobre o piso claro) e o limiar resultante
+// não representa a fronteira real fita/piso.
+const int LIMIAR_LINHA_SPAN_MINIMO = 500;
+
 void calibrarSensoresLinha() {
     modo_linha = false; modo_explora = false; modo_waypoints = false; parar_motores(); estadoManobraAtual = LIVRE; estadoExplora = EXPLORA_LIVRE; total_waypoints = 0;
-    
-    // Lê os dois sensores no início (assumindo que o robô está centralizado na fita, lendo o fundo/chão)
-    int leituraEsqInicial = analogRead(SENSOR_LINHA_ESQUERDO);
-    int leituraDirInicial = analogRead(SENSOR_LINHA_DIREITO);
-    int fundoInicial = (leituraEsqInicial + leituraDirInicial) / 2; 
-    
+
+    // Média de várias amostras (em vez de uma leitura instantânea) para reduzir
+    // o efeito do ruído do ADC nesse valor de referência.
+    long somaFundo = 0; const int N_AMOSTRAS_FUNDO = 10;
+    for (int i = 0; i < N_AMOSTRAS_FUNDO; i++) {
+        somaFundo += (analogRead(SENSOR_LINHA_ESQUERDO) + analogRead(SENSOR_LINHA_DIREITO)) / 2;
+        delay(5);
+    }
+    int fundoInicial = somaFundo / N_AMOSTRAS_FUNDO;
+
     int minVal = 4095; int maxVal = 0; uint32_t inicio = millis();
-    
+
     while (millis() - inicio < 2500) {
         if (((millis() - inicio) / 250) % 2 == 0) mover_motores(60, -60); else mover_motores(-60, 60);
         int leituraEsq = analogRead(SENSOR_LINHA_ESQUERDO); int leituraDir = analogRead(SENSOR_LINHA_DIREITO);
@@ -1390,17 +1613,48 @@ void calibrarSensoresLinha() {
         if (leituraEsq > maxVal) maxVal = leituraEsq; if (leituraDir > maxVal) maxVal = leituraDir;
         delay(10);
     }
-    parar_motores(); 
-    limiarLinha = (minVal + maxVal) / 2; 
-    
-    // Se a média da cor do chão é menor que o limiar (ex: branco reflete mais IR), a linha procurada é a escura
+    parar_motores();
+
+    int span = maxVal - minVal;
+    int novoLimiar = (minVal + maxVal) / 2;
+
+    // 1) O giro precisa ter cruzado fita e piso com contraste real. Se o span
+    //    for pequeno, a calibração provavelmente foi feita inteira sobre uma
+    //    única superfície (ex.: só piso claro, sem a fita embaixo) — nesse caso
+    //    NÃO sobrescrevemos a calibração/persistência anterior.
+    // 2) A leitura inicial (fundoInicial) precisa cair claramente para um dos
+    //    lados do novo limiar. Se estiver perto demais do meio do range, ela
+    //    não é confiável para decidir a polaridade (linha_escura) — sinal de
+    //    que o robô não começou de fato sobre a fita.
+    bool span_ok = (span >= LIMIAR_LINHA_SPAN_MINIMO);
+    bool fundo_ambiguo = abs(fundoInicial - novoLimiar) < (span / 4);
+
+    if (!span_ok || fundo_ambiguo) {
+        Serial.printf("[CALIBRACAO] REJEITADA: min=%d max=%d span=%d fundoInicial=%d limiar_calc=%d "
+                      "(span_ok=%d fundo_ambiguo=%d). Posicione o robo COM os sensores sobre a fita "
+                      "antes de iniciar a calibracao.\n",
+                      minVal, maxVal, span, fundoInicial, novoLimiar, span_ok, fundo_ambiguo);
+
+        JsonDocument json;
+        json["status"] = "calibracao_falhou";
+        json["motivo"] = !span_ok ? "contraste_insuficiente" : "fundo_ambiguo";
+        json["min"] = minVal; json["max"] = maxVal; json["span"] = span; json["fundoInicial"] = fundoInicial;
+        size_t msg_comp = measureJson(json); char msg[msg_comp + 1]; serializeJson(json, msg, (msg_comp + 1)); msg[msg_comp] = 0;
+        if (ws.count() > 0) ws.textAll(msg, msg_comp);
+        return;
+    }
+
+    limiarLinha = novoLimiar;
     linha_escura = (fundoInicial < limiarLinha);
-    
+
+    Serial.printf("[CALIBRACAO] OK: min=%d max=%d span=%d fundoInicial=%d limiar=%d linha_escura=%d\n",
+                  minVal, maxVal, span, fundoInicial, limiarLinha, linha_escura);
+
     SPIFFS.begin(DIRETORIO_SPIFFS, false); SPIFFS.putInt("limiar", limiarLinha); SPIFFS.putBool("linha_escura", linha_escura); SPIFFS.end();
-    
-    JsonDocument json; json["status"] = "calibrado"; json["limiar"] = limiarLinha; json["escura"] = linha_escura;
+
+    JsonDocument json; json["status"] = "calibrado"; json["limiar"] = limiarLinha; json["escura"] = linha_escura; json["span"] = span;
     size_t msg_comp = measureJson(json); char msg[msg_comp + 1]; serializeJson(json, msg, (msg_comp + 1)); msg[msg_comp] = 0;
-    if (ws.count() > 0) ws.textAll(msg, msg_comp);
+    if (ws.count() > 0) ws.textAll(msg, msg_comp); 
 }
 
 void verificarSegurancaBateria() {
