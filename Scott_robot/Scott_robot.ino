@@ -1,6 +1,6 @@
 /*******************************************************************************
 * Scott Robot - Kit Robo Explorer - Joystick + Linha + Exploração + Waypoints GPS + Odometria + Grid Mapping
-* Controle o seu Rocket Tank pelo celular ou ative os modos autônomos.
+* (Versão sem Encoders - Estimativa por Tempo e GPS)
 *******************************************************************************/
 
 // --------------------------------------------------
@@ -35,6 +35,7 @@ const uint8_t PINO_HCSR04_TRIGGER = 25;
 HardwareSerial SerialGPS(2);
 TinyGPS gps;
 uint32_t timeout_gps = 0; 
+float robot_speed_cms = 0.0;
 
 // Waypoints GPS Fila e Segurança
 bool modo_waypoints = false;
@@ -49,7 +50,6 @@ bool wp_evita_colisao = true;
 enum EstadoWaypoint { WAY_LIVRE, WAY_RE, WAY_GIRO };
 EstadoWaypoint estadoWay = WAY_LIVRE;
 unsigned long posicao_inicial_way = 0;
-uint32_t alvoPulsosWay = 0;
 uint32_t tempo_inicio_manobra_way = 0;
 int sentido_giro_way = 1; 
 
@@ -59,22 +59,16 @@ const uint32_t EMPURRAO_ANTISTALL_WAYPOINT_MS = 1200;
 const int LIMITE_GIROS_ANTISTALL_WAYPOINT = 4;       
 int giros_consecutivos_way = 0;
 
-// --- VARIÁVEIS DE ODOMETRIA E FUSÃO (Dead Reckoning) ---
-const float CM_POR_PULSO = 30.0 / 100.0;
-const float LARGURA_ESTEIRA_EFETIVA = (260.0 * 0.3 * 2.0) / PI;
-
+// --- VARIÁVEIS DE ODOMETRIA E FUSÃO (Estimada por tempo) ---
 float estimativa_lat = 0.0;
 float estimativa_lon = 0.0;
 float theta_rad = 0.0; 
 
-unsigned long odo_esq_anterior = 0;
-unsigned long odo_dir_anterior = 0;
 bool odometria_inicializada = false;
 bool heading_gps_valido = false; 
 
 float lat_inicio_calibracao = 0.0;
 float lon_inicio_calibracao = 0.0;
-unsigned long pulsos_inicio_calibracao = 0; 
 bool registrou_inicio_calibracao = false;
 
 int sinal_esq = 0; 
@@ -106,36 +100,6 @@ bool obstaculo_virtual_detectado(float distancia_projecao_cm) {
     }
     return false;
 }
-
-// ALVOS DE PULSOS PARA MANOBRAS (usados nos deslocamentos retos, ex. PULSOS_20_CM no reposicionamento em ré)
-// Os alvos de GIRO em graus (antigos PULSOS_45_GRAUS/90/180, removidos) foram
-// substituídos em explora_casa() por um alvo de ROTAÇÃO MEDIDA (theta_rad, ver
-// alvoAnguloGiroRad), já que contar pulsos de uma roda só presumia as duas
-// esteiras girando em sincronia, o que não é verdade quando uma delas
-// patina/derrapa parada durante o giro.
-const uint32_t PULSOS_30_CM = 100;  
-const uint32_t PULSOS_20_CM = 67;  
-const uint32_t PULSOS_15_CM = 50;  
-
-// MAPEAMENTO E VARIÁVEIS DOS ENCODERS
-const int PINO_ENC_ESQ_A = 21; 
-const int PINO_ENC_ESQ_B = 22; 
-const int PINO_ENC_DIR_A = 19; 
-const int PINO_ENC_DIR_B = 23; 
-
-volatile unsigned long contador_esq_A = 0;
-volatile unsigned long contador_esq_B = 0;
-volatile unsigned long contador_dir_A = 0;
-volatile unsigned long contador_dir_B = 0;
-
-const int NUMERO_CONTADORES = 2;
-const int NUMERO_LEITURAS = 2;
-const int NUMERO_DENTES = 10; 
-unsigned long tempo_antes_encoder = 0;
-const long INTERVALO_CALCULO = 1000; 
-float velocidade_rpm_esq = 0;
-float velocidade_rpm_dir = 0;
-float robot_speed_cms = 0;
 
 // JSON aliases
 const char *ALIAS_ANGULO = "angulo";
@@ -175,14 +139,11 @@ const int SENSOR_LINHA_DIREITO = 39;
 
 int leitura_esquerdo = 0;
 int leitura_direito = 0;
-
-// --- Leitura filtrada dos sensores de linha (média móvel exponencial p/ reduzir ruído do ADC) ---
 float leitura_esquerda_filtrada = 0.0;
 float leitura_direita_filtrada = 0.0;
-const float ALPHA_FILTRO_LINHA = 0.5; // 0 = sem filtro, 1 = ignora leitura nova (mais suave = mais perto de 0)
+const float ALPHA_FILTRO_LINHA = 0.5;
 
-// --- Normalização do erro proporcional e controle de tempo (dt) do PID ---
-const float FATOR_NORMALIZACAO_LINHA = 2500.0; // diferença de leitura (ADC) que equivale a erro = 1.0
+const float FATOR_NORMALIZACAO_LINHA = 2500.0; 
 unsigned long pid_tempo_anterior = 0;
 
 int limiarLinha = 3000;
@@ -211,48 +172,30 @@ bool modo_explora = false;
 
 enum EstadoManobra { LIVRE, MANOBRA_QUEDA_RE, MANOBRA_QUEDA_GIRO, MANOBRA_PAREDE_RE, MANOBRA_PAREDE_GIRO };
 EstadoManobra estadoManobraAtual = LIVRE;
-unsigned long posicao_inicial_manobra = 0;
-uint32_t alvoPulsosManobra = 0;
 
-// --- MÁQUINA DE ESTADOS EXPLORAÇÃO SIMPLIFICADA E SORTEADA ---
+// --- MÁQUINA DE ESTADOS EXPLORAÇÃO (Baseada em Tempo) ---
 enum EstadoExploracao { EXPLORA_LIVRE, EXPLORA_RE, EXPLORA_GIRO, EXPLORA_PARADO };
 EstadoExploracao estadoExplora = EXPLORA_LIVRE;
 int giros_consecutivos = 0; 
-unsigned long posicao_inicial_explora = 0;
-uint32_t alvoPulsosExplora = 0; 
-uint32_t tempo_inicio_manobra_explora = 0; 
-const uint32_t TIMEOUT_MAX_EXPLORA = 6000;  
+uint32_t tempo_inicio_manobra_explora = 0;
+uint32_t alvoTempoExplora = 0; 
 int sentido_giro_atual = 1;
 const int MAX_GIROS_CONSECUTIVOS = 3;
-
-// --- GIRO POR ODOMETRIA (usa os DOIS encoders, não só o esquerdo) ---
-// theta_rad já é atualizado em atualizar_odometria_fusao() a partir da
-// DIFERENÇA entre os pulsos esquerdo e direito — é uma medida melhor de
-// quanto o robô realmente girou do que contar pulsos de uma roda só,
-// porque não assume que as duas esteiras avançam na mesma proporção.
-float giro_acumulado_rad = 0.0;
-float alvoAnguloGiroRad = 0.0;
-
-// --- DETECÇÃO DE ESTEIRA PATINANDO (SKID) DURANTE O GIRO ---
-unsigned long posicao_inicial_dir_explora = 0;
-unsigned long ultimo_check_stall_ms = 0;
-unsigned long ultima_contagem_esq_stall = 0;
-unsigned long ultima_contagem_dir_stall = 0;
-const uint32_t INTERVALO_CHECK_STALL_MS = 200;
-const uint32_t PULSOS_MINIMOS_NAO_TRAVADO = 2;
 const uint32_t DURACAO_KICK_ANTISTALL_MS = 150;
+const uint32_t TEMPO_RE_EXPLORA_MS = 1000;
+const uint32_t TEMPO_GIRO_90_MS = 1200;
+const uint32_t TEMPO_GIRO_45_MS = 600;
 
 bool modoSegurancaBateria = false;
-uint32_t ultima_tensao_bateria_mv = 0; // exposta p/ debug (atualizada em verificarSegurancaBateria)
+uint32_t ultima_tensao_bateria_mv = 0; 
 const uint32_t TENSAO_CRITICA = 6400;
 
 Preferences SPIFFS; 
 const char* DIRETORIO_SPIFFS = "seguidor";
 const char* ENDERECOS_SPIFFS[4] = {"espera", "Kp", "Ki", "Kd"};
-const float VALORES_PADROES[4] = {10.0, 6.0, 0.2, 20};
 
 // --------------------------------------------------
-// Pagina web principal
+// Pagina web principal (Inalterada)
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -458,7 +401,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 
         var connection = new WebSocket(`ws://${window.location.hostname}/ws`);
         connection.onopen = function () { console.log('Connection opened'); };
-connection.onmessage = function (e) {
+        connection.onmessage = function (e) {
             const data = JSON.parse(e.data);
             
             if (data["vbat"]) {
@@ -492,7 +435,6 @@ connection.onmessage = function (e) {
             if (data["date"] !== undefined) document.getElementById("gps-date").innerText = data["date"];
             if (data["time"] !== undefined) document.getElementById("gps-time").innerText = data["time"];
             
-            // --- BLOCO NOVO: Tratamento do retorno da calibração ---
             if (data["status"] === "calibrado") {
                 let corDetectada = data["escura"] ? "Linha Escura" : "Linha Clara";
                 document.getElementById('statusCalibracao').innerText = "OK! Limiar: " + data["limiar"] + " (" + corDetectada + ")";
@@ -505,7 +447,6 @@ connection.onmessage = function (e) {
                 document.getElementById('statusCalibracao').innerText = "Calibration rejected! (" + motivoTexto + ") Posicione o robo sobre a fita e tente de novo.";
                 document.getElementById('statusCalibracao').style.color = "#e53935";
             }
-            // --------------------------------------------------------
         };
 
         function showTab(tab) {
@@ -624,14 +565,6 @@ void parar_motores();
 void atualizar_odometria_fusao();
 
 // --------------------------------------------------
-// INTERRUPÇÕES DOS ENCODERS
-
-void IRAM_ATTR isr_esq_A() { contador_esq_A++; }
-void IRAM_ATTR isr_esq_B() { contador_esq_B++; }
-void IRAM_ATTR isr_dir_A() { contador_dir_A++; }
-void IRAM_ATTR isr_dir_B() { contador_dir_B++; }
-
-// --------------------------------------------------
 // FUNÇÕES WRAPPER DE MOTORES PARA ODOMETRIA
 
 void mover_motores(int v_esq, int v_dir) {
@@ -650,17 +583,14 @@ void parar_motores() {
 
 void setup() {
   Serial.begin(115200);
-  delay(300); // dá tempo do monitor serial conectar antes da primeira mensagem
+  delay(300);
   Serial.println("=====================================");
-  Serial.println("FIRMWARE Scott_robot - build debug-v5 (contador_parada por erro, nao mais por sensor absoluto)");
-  Serial.println("(erro proporcional + PID por dt + vbat/segBat/contParada no log)");
+  Serial.println("FIRMWARE Scott_robot - Sem Encoders (Estimativa Tempo/GPS)");
   Serial.println("=====================================");
   
   SerialGPS.setRxBufferSize(1024);
   SerialGPS.begin(9600, SERIAL_8N1, PINO_GPS_RX, PINO_GPS_TX);
   
-  Serial.println("RoboCore - Kit Robo Explorer - Waypoints GPS Multi");
-
   pinMode(PINO_LED, OUTPUT);
   digitalWrite(PINO_LED, LOW);
 
@@ -670,16 +600,6 @@ void setup() {
 
   pinMode(SENSOR_LINHA_ESQUERDO, INPUT);
   pinMode(SENSOR_LINHA_DIREITO, INPUT);
-
-  pinMode(PINO_ENC_ESQ_A, INPUT);
-  pinMode(PINO_ENC_ESQ_B, INPUT);
-  pinMode(PINO_ENC_DIR_A, INPUT);
-  pinMode(PINO_ENC_DIR_B, INPUT);
-
-  attachInterrupt(digitalPinToInterrupt(PINO_ENC_ESQ_A), isr_esq_A, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(PINO_ENC_ESQ_B), isr_esq_B, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(PINO_ENC_DIR_A), isr_dir_A, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(PINO_ENC_DIR_B), isr_dir_B, CHANGE);
 
   WiFi.mode(WIFI_AP);
 #if ESP_ARDUINO_VERSION_MAJOR > 2
@@ -703,15 +623,12 @@ void setup() {
 
   SPIFFS.begin(DIRETORIO_SPIFFS, false);
   espera = SPIFFS.getFloat(ENDERECOS_SPIFFS[0], 10);
- // Kp = SPIFFS.getFloat(ENDERECOS_SPIFFS[1], 40);
   Kp = 40.0; 
   Ki = SPIFFS.getFloat(ENDERECOS_SPIFFS[2], 0.2);
   Kd = SPIFFS.getFloat(ENDERECOS_SPIFFS[3], 0.4);
   limiarLinha = SPIFFS.getInt("limiar", 3000); 
   linha_escura = SPIFFS.getBool("linha_escura", true);
   SPIFFS.end();
-
-  Serial.printf("[BOOT] Calibracao de linha carregada: limiar=%d linha_escura=%d\n", limiarLinha, linha_escura);
 
   memset(occupancyMap, 0, sizeof(occupancyMap));
 }
@@ -732,38 +649,6 @@ void loop() {
   static uint32_t ultimoCheckBateria = 0;
   if (millis() - ultimoCheckBateria > 2000) { ultimoCheckBateria = millis(); verificarSegurancaBateria(); }
 
-  static unsigned long last_contador_esq_A = 0;
-  static unsigned long last_contador_esq_B = 0;
-  static unsigned long last_contador_dir_A = 0;
-  static unsigned long last_contador_dir_B = 0;
-
-  if ((millis() - tempo_antes_encoder) > INTERVALO_CALCULO) {
-    unsigned long delta_esq_A = contador_esq_A - last_contador_esq_A;
-    unsigned long delta_esq_B = contador_esq_B - last_contador_esq_B;
-    int media_esq = (delta_esq_A + delta_esq_B) / NUMERO_CONTADORES;
-    velocidade_rpm_esq = (float)media_esq / (NUMERO_DENTES * NUMERO_LEITURAS) * (60000.0 / INTERVALO_CALCULO);
-
-    unsigned long delta_dir_A = contador_dir_A - last_contador_dir_A;
-    unsigned long delta_dir_B = contador_dir_B - last_contador_dir_B;
-    int media_dir = (delta_dir_A + delta_dir_B) / NUMERO_CONTADORES;
-    velocidade_rpm_dir = (float)media_dir / (NUMERO_DENTES * NUMERO_LEITURAS) * (60000.0 / INTERVALO_CALCULO);
-
-    float media_rpm = (velocidade_rpm_esq + velocidade_rpm_dir) / 2.0;
-    robot_speed_cms = (media_rpm * 20.4) / 60.0;
-
-    if (ws.count() > 0) {
-      JsonDocument json; json["robot_speed"] = robot_speed_cms;
-      size_t msg_comp = measureJson(json); char msg[msg_comp + 1];
-      serializeJson(json, msg, msg_comp + 1); msg[msg_comp] = 0; ws.textAll(msg, msg_comp);
-    }
-
-    last_contador_esq_A = contador_esq_A;
-    last_contador_esq_B = contador_esq_B;
-    last_contador_dir_A = contador_dir_A;
-    last_contador_dir_B = contador_dir_B;
-    tempo_antes_encoder = millis();
-  }
-
   if (modoSegurancaBateria) {
       modo_linha = false; modo_explora = false; modo_waypoints = false;
       parar_motores();
@@ -771,20 +656,6 @@ void loop() {
       if (modo_linha) segue_linha();
       else if (modo_explora) explora_casa();
       else if (modo_waypoints) navega_waypoints();
-  }
-
-  // --- STATUS GERAL (sempre roda, independente do modo) ---
-  // Existe pra diagnosticar quando segue_linha() nem chega a ser chamado
-  // (ex.: preso em modoSegurancaBateria mesmo com o app mostrando "Linha" ativa).
-  static uint32_t timeout_debug_status = 0;
-  if (millis() > timeout_debug_status) {
-      Serial.printf(
-          "[STATUS] modo_linha=%d modo_explora=%d modo_waypoints=%d | modoSegurancaBateria=%d vbat=%4lumV | contador_parada=%d | pulsos_brutos_esq=%lu pulsos_brutos_dir=%lu\n",
-          modo_linha, modo_explora, modo_waypoints,
-          modoSegurancaBateria, (unsigned long)ultima_tensao_bateria_mv,
-          contador_parada, (unsigned long)contador_esq_A, (unsigned long)contador_dir_A
-      );
-      timeout_debug_status = millis() + 500;
   }
 
   if (millis() > timeout_vbat) {
@@ -822,10 +693,15 @@ void loop() {
         JsonDocument json;
         if (flat == TinyGPS::GPS_INVALID_F_ANGLE) { json["lat"] = nullptr; json["lon"] = nullptr; } 
         else { 
-            json["lat"] = odometria_inicializada ? estimativa_lat : flat; 
-            json["lon"] = odometria_inicializada ? estimativa_lon : flon; 
+            json["lat"] = flat; 
+            json["lon"] = flon; 
         }
         json["date"] = date_str; json["time"] = time_str;
+        
+        // --- VELOCIDADE DO GPS ---
+        float speed_kmph = gps.f_speed_kmph();
+        robot_speed_cms = (speed_kmph == TinyGPS::GPS_INVALID_F_SPEED) ? 0.0 : (speed_kmph * 27.7778);
+        json["robot_speed"] = robot_speed_cms;
         
         size_t msg_comp = measureJson(json); char msg[msg_comp + 1];
         serializeJson(json, msg, (msg_comp + 1)); msg[msg_comp] = 0; ws.textAll(msg, msg_comp);
@@ -869,24 +745,13 @@ void processar_mapeamento_e_telemetria(void) {
 
 // --------------------------------------------------
 void carregar_mapa_salvo() {
-    if (!LittleFS.begin(true)) {
-        Serial.println("Erro ao montar o sistema de arquivos LittleFS!");
-        return;
-    }
-
+    if (!LittleFS.begin(true)) { return; }
     File file = LittleFS.open("/mapa_salvo.json", "r");
-    if (!file) {
-        Serial.println("Arquivo de mapa não encontrado na memória flash.");
-        return;
-    }
+    if (!file) { return; }
 
     JsonDocument doc;
     DeserializationError error = deserializeJson(doc, file);
-    if (error) {
-        Serial.println("Falha ao ler o JSON do mapa.");
-        file.close();
-        return;
-    }
+    if (error) { file.close(); return; }
 
     JsonObject obj = doc.as<JsonObject>();
     for (JsonPair kv : obj) {
@@ -900,52 +765,40 @@ void carregar_mapa_salvo() {
         int grid_y = y + (MAP_HEIGHT / 2);
 
         if (grid_x >= 0 && grid_x < MAP_WIDTH && grid_y >= 0 && grid_y < MAP_HEIGHT) {
-            // Se o score salvo for >= 70, marca como obstáculo (2). Se for <= 30, livre (1).
             occupancyMap[grid_x][grid_y] = (score >= 70) ? 2 : ((score <= 30) ? 1 : 0);
         }
     }
     file.close();
-    Serial.println("Mapa carregado com sucesso na RAM! Scott agora conhece o ambiente.");
 }
 
 // --------------------------------------------------
 
 void atualizar_odometria_fusao() {
-    long pulsos_esq_atual = contador_esq_A;
-    long pulsos_dir_atual = contador_dir_A;
-    
-    long delta_esq = (long)(pulsos_esq_atual - odo_esq_anterior) * sinal_esq;
-    long delta_dir = (long)(pulsos_dir_atual - odo_dir_anterior) * sinal_dir;
-    
-    odo_esq_anterior = pulsos_esq_atual; odo_dir_anterior = pulsos_dir_atual;
-    
-    float dist_esq = delta_esq * CM_POR_PULSO; float dist_dir = delta_dir * CM_POR_PULSO;
-    float dist_centro = (dist_esq + dist_dir) / 2.0;
-    
-    float delta_theta = (dist_esq - dist_dir) / LARGURA_ESTEIRA_EFETIVA;
+    static unsigned long tempo_anterior = millis();
+    unsigned long agora = millis();
+    float dt = (agora - tempo_anterior) / 1000.0;
+    tempo_anterior = agora;
+
+    // Sem encoders, fazemos odometria open-loop estimada pelos comandos do motor
+    // para tentar manter o Grid Mapping mais ou menos funcional localmente
+    float dist_centro = 0.0;
+    float delta_theta = 0.0;
+
+    // Estimativas de 30 cm/s para avanço e 1.5 rad/s para giro (ajuste se necessário)
+    if (sinal_esq == 1 && sinal_dir == 1) { dist_centro = 30.0 * dt; }
+    else if (sinal_esq == -1 && sinal_dir == -1) { dist_centro = -30.0 * dt; }
+    else if (sinal_esq == -1 && sinal_dir == 1) { delta_theta = 1.5 * dt; }
+    else if (sinal_esq == 1 && sinal_dir == -1) { delta_theta = -1.5 * dt; }
+
     theta_rad += delta_theta;
+    while (theta_rad >= TWO_PI) theta_rad -= TWO_PI; 
+    while (theta_rad < 0) theta_rad += TWO_PI;
     
-    // Acumulador de rotação SEM wraparound, usado por explora_casa() para medir
-    // o giro em andamento. theta_rad (abaixo) é mantido "enrolado" em [0, 2π) —
-    // ótimo para heading absoluto, mas ruim para medir "quanto girei desde que
-    // comecei este giro" quando um único salto (ex.: depois de um kick
-    // anti-derrapagem bloqueante) pode passar de 180°. Somando o delta bruto
-    // aqui, giro nenhum fica escondido, não importa o tamanho do salto.
-    giro_acumulado_rad += delta_theta;
-    
-    while (theta_rad >= TWO_PI) theta_rad -= TWO_PI; while (theta_rad < 0) theta_rad += TWO_PI;
-    
-    float delta_x_cm = dist_centro * cos(theta_rad); float delta_y_cm = dist_centro * sin(theta_rad); 
+    float delta_x_cm = dist_centro * cos(theta_rad); 
+    float delta_y_cm = dist_centro * sin(theta_rad); 
     
     robot_local_x_cm += delta_x_cm;
     robot_local_y_cm += delta_y_cm;
-
-    float delta_lat = delta_x_cm / 11132000.0; float delta_lon = 0.0;
-    
-    if (odometria_inicializada) {
-        delta_lon = delta_y_cm / (11132000.0 * cos(estimativa_lat * PI / 180.0));
-        estimativa_lat += delta_lat; estimativa_lon += delta_lon;
-    }
 
     float flat, flon; unsigned long age;
     gps.f_get_position(&flat, &flon, &age);
@@ -957,21 +810,9 @@ void atualizar_odometria_fusao() {
             odometria_inicializada = true; heading_gps_valido = false; registrou_inicio_calibracao = false;
         } else {
             if (flat != ultimo_flat_processado && age < 3000) { 
-                estimativa_lat = (estimativa_lat * 0.85) + (flat * 0.15); 
-                estimativa_lon = (estimativa_lon * 0.85) + (flon * 0.15); 
+                estimativa_lat = flat;
+                estimativa_lon = flon; 
                 ultimo_flat_processado = flat;
-                
-                if (!heading_gps_valido && modo_waypoints) {
-                    if (!registrou_inicio_calibracao) {
-                        lat_inicio_calibracao = flat; lon_inicio_calibracao = flon; pulsos_inicio_calibracao = contador_esq_A; registrou_inicio_calibracao = true;
-                    } else {
-                        float dist_fisica_cm = (contador_esq_A - pulsos_inicio_calibracao) * CM_POR_PULSO;
-                        if (dist_fisica_cm >= 250.0) {
-                            float curso_calculado = TinyGPS::course_to(lat_inicio_calibracao, lon_inicio_calibracao, flat, flon);
-                            theta_rad = curso_calculado * PI / 180.0; heading_gps_valido = true; 
-                        }
-                    }
-                }
             }
         }
     }
@@ -1084,13 +925,10 @@ void atualizar_sensor_ultrassonico(void) {
 }
 
 // --------------------------------------------------
-// --------------------------------------------------
 void segue_linha() {
   leitura_esquerdo = analogRead(SENSOR_LINHA_ESQUERDO); 
   leitura_direito = analogRead(SENSOR_LINHA_DIREITO);
 
-  // Filtro passa-baixa (média móvel exponencial) para não deixar ruído do ADC,
-  // perto do limiar, virar um "salto" de estado e disparar o derivativo à toa.
   if (leitura_esquerda_filtrada == 0.0 && leitura_direita_filtrada == 0.0) {
       leitura_esquerda_filtrada = leitura_esquerdo;
       leitura_direita_filtrada  = leitura_direito;
@@ -1099,33 +937,12 @@ void segue_linha() {
       leitura_direita_filtrada  = (ALPHA_FILTRO_LINHA * leitura_direito)  + ((1.0 - ALPHA_FILTRO_LINHA) * leitura_direita_filtrada);
   }
 
-  // --- ERRO PROPORCIONAL ---
-  // Em vez de degraus fixos (0/±1/±2), o erro agora reflete o QUANTO a linha
-  // está desviada, calculado direto da diferença analógica entre os sensores.
-  // Sinal: positivo = linha mais para a direita (precisa virar à direita).
-  // IMPORTANTE: por ser uma DIFERENÇA entre os dois sensores, esse erro é
-  // imune a uma queda de leitura que afete os dois sensores igualmente
-  // (ex.: alimentação caindo um pouco sob carga dos motores) — só reage
-  // quando os sensores discordam entre si, que é o que realmente importa.
   float sinalPolaridade = linha_escura ? 1.0 : -1.0;
   erro = sinalPolaridade * (leitura_direita_filtrada - leitura_esquerda_filtrada) / FATOR_NORMALIZACAO_LINHA;
   if (erro > 2.0) erro = 2.0;
   if (erro < -2.0) erro = -2.0;
 
-  // --- DETECÇÃO DE LINHA PERDIDA ---
-  // O erro proporcional (diferença ENTRE os sensores) satura quando a linha
-  // está claramente descentralizada, mas fica cego a um caso: os DOIS
-  // sensores saindo da fita ao mesmo tempo, lendo valores parecidos entre si
-  // (erro ~0) sem que nenhum deles esteja de fato sobre a fita. Por isso,
-  // além da saturação do erro relativo, checamos também se AMBOS os
-  // sensores estão do lado "fundo" (fora da fita) do limiar absoluto.
   bool erro_saturado = (fabs(erro) >= 1.9);
-  // "Fora da fita" = os dois sensores lendo o valor de FUNDO (piso), não de linha.
-  // Se linha_escura=true, a fita é o extremo ALTO e o piso é o BAIXO -> fora da
-  // fita = os dois ABAIXO do limiar. Se linha_escura=false (seu caso: piso alto,
-  // fita baixa), fora da fita = os dois ACIMA do limiar. (Corrigido: a versão
-  // anterior tinha os dois ramos trocados, fazendo o robô se achar "fora da
-  // fita" bem no meio do seguimento normal.)
   bool ambos_fora_da_fita = linha_escura
       ? (leitura_esquerda_filtrada < limiarLinha && leitura_direita_filtrada < limiarLinha)
       : (leitura_esquerda_filtrada > limiarLinha && leitura_direita_filtrada > limiarLinha);
@@ -1137,47 +954,19 @@ void segue_linha() {
   }
 
   if (contador_parada >= CONTAGEM_MAXIMA) {
-      // Ficou tempo demais com a linha genuinamente perdida: para e zera o PID.
-      // Isso roda ANTES de calcular/mandar velocidade, então não fica mais
-      // mandando "anda" e "para" no mesmo loop.
       parar_motores();
       P = 0; I = 0; D = 0; erro = 0.0; erro_anterior = 0.0;
       contador_parada = CONTAGEM_MAXIMA;
   } else if (ambos_fora_da_fita) {
-      // Nenhum sensor está de fato sobre a fita agora — a diferença calculada
-      // em "erro" não reflete a posição da linha, é só descasamento/ruído entre
-      // os dois canais do ADC enquanto ambos enxergam apenas o piso. Alimentar
-      // isso no PID gera giros que não têm relação com onde a fita realmente
-      // está (é o que fazia o robô virar sozinho antes mesmo de detectar a
-      // fita pela primeira vez). Enquanto estiver assim, anda reto e preserva
-      // o estado do PID (P/I/D/erro_anterior) intacto, para retomar suave
-      // quando a fita reaparecer sob um dos sensores.
       mover_motores(VELOCIDADE, VELOCIDADE);
   } else {
       calcula_PID();
       mover_motores(velocidade_esquerda, velocidade_direita);
   }
-
-  // --- DEBUG DE TUNING (remover/comentar depois de ajustar Kp/Ki/Kd) ---
-  // Limitado a ~5x/s para não sobrecarregar a serial nem atrasar o loop.
-  static uint32_t timeout_debug_linha = 0;
-  if (millis() > timeout_debug_linha) {
-      Serial.printf(
-          "esq=%4d dir=%4d | filt_esq=%6.0f filt_dir=%6.0f | erro=%+.2f P=%+.2f I=%+.2f D=%+.2f resp=%+.1f | v_esq=%4d v_dir=%4d | vbat=%4lumV segBat=%d contParada=%d\n",
-          leitura_esquerdo, leitura_direito,
-          leitura_esquerda_filtrada, leitura_direita_filtrada,
-          erro, P, I, D, resposta_PID,
-          velocidade_esquerda, velocidade_direita,
-          (unsigned long)ultima_tensao_bateria_mv, modoSegurancaBateria, contador_parada
-      );
-      timeout_debug_linha = millis() + 200;
-  }
-
   delay(espera);
 }
+
 // --------------------------------------------------
-// NOVA FUNÇÃO DO MODO DE EXPLORAÇÃO
-// O Robô dá ré e em seguida sorteia aleatoriamente se irá girar 90 graus para a esquerda ou para a direita
 void explora_casa() {
     bool obstaculo_frente = ((distancia > 0) && (distancia <= DISTANCIA_EXPLORACAO));
     bool queda_detectada = (analogRead(SENSOR_LINHA_ESQUERDO) > LIMIAR_QUEDA) || (analogRead(SENSOR_LINHA_DIREITO) > LIMIAR_QUEDA);
@@ -1186,194 +975,40 @@ void explora_casa() {
     if (estadoExplora == EXPLORA_PARADO) { parar_motores(); return; }
 
     if (estadoExplora != EXPLORA_LIVRE) {
-        if (millis() - tempo_inicio_manobra_explora > TIMEOUT_MAX_EXPLORA) {
-            // Segmento (ré ou giro) não terminou dentro do prazo. Trata isso
-            // como uma TENTATIVA FALHA, sujeita ao MESMO limite de tentativas
-            // (MAX_GIROS_CONSECUTIVOS) usado quando o giro termina mas o
-            // obstáculo continua lá. Antes, um timeout resetava
-            // giros_consecutivos = 0 e voltava pra EXPLORA_LIVRE — como o
-            // sensor de obstáculo tende a continuar "bloqueado" logo em
-            // seguida (o giro não tinha terminado de verdade), isso reiniciava
-            // ré+giro do zero indefinidamente, e cada tentativa nova podia
-            // gastar até TIMEOUT_MAX_EXPLORA girando — several reinícios somam
-            // várias voltas completas, mesmo com o teto de 180° por episódio.
-            parar_motores(); delay(100); giros_consecutivos++;
-
-            if (giros_consecutivos >= MAX_GIROS_CONSECUTIVOS || estadoExplora == EXPLORA_RE) {
-                // Limite de tentativas estourado, OU travou tentando dar ré
-                // (sem uma estratégia melhor de recuperação pra isso) -
-                // mais seguro parar e sinalizar do que insistir sem fim.
-                estadoExplora = EXPLORA_PARADO; if (ws.count() > 0) ws.textAll("{\"stuck\":true}");
-            } else {
-                // Ainda dentro do limite de tentativas: continua girando na
-                // mesma direção sorteada, com um novo alvo (45°) e prazo frescos.
-                mover_motores(-VELOCIDADE_MAXIMA * sentido_giro_atual, VELOCIDADE_MAXIMA * sentido_giro_atual);
-                delay(DURACAO_KICK_ANTISTALL_MS);
-                mover_motores(-VELOCIDADE_GIRO * sentido_giro_atual, VELOCIDADE_GIRO * sentido_giro_atual);
-                posicao_inicial_explora = contador_esq_A;
-                posicao_inicial_dir_explora = contador_dir_A;
-                giro_acumulado_rad = 0.0;
-                alvoAnguloGiroRad = PI / 4.0;
-                tempo_inicio_manobra_explora = millis();
-                ultimo_check_stall_ms = millis();
-                ultima_contagem_esq_stall = contador_esq_A;
-                ultima_contagem_dir_stall = contador_dir_A;
-            }
-            return;
-        }
         
-        if (estadoExplora == EXPLORA_RE) {
-            // --- VIGIA ANTI-DERRAPAGEM (mesma ideia usada no giro) ---
-            // Também dando ré, uma esteira pode ficar presa (atrito estático)
-            // enquanto a outra se move sozinha — o mesmo sintoma relatado para
-            // o giro, só que em linha reta. Sem essa checagem o robô podia
-            // "achar" que andou 20cm de ré usando só o encoder esquerdo,
-            // mesmo com o direito parado (ou vice-versa).
-            if (millis() - ultimo_check_stall_ms >= INTERVALO_CHECK_STALL_MS) {
-                unsigned long delta_esq_stall = contador_esq_A - ultima_contagem_esq_stall;
-                unsigned long delta_dir_stall = contador_dir_A - ultima_contagem_dir_stall;
-                ultima_contagem_esq_stall = contador_esq_A;
-                ultima_contagem_dir_stall = contador_dir_A;
-                ultimo_check_stall_ms = millis();
-
-                if (delta_esq_stall < PULSOS_MINIMOS_NAO_TRAVADO || delta_dir_stall < PULSOS_MINIMOS_NAO_TRAVADO) {
-                    if (ws.count() > 0) ws.textAll("{\"aviso\":\"esteira patinando na re, reforcando torque\"}");
-                    mover_motores(-VELOCIDADE_MAXIMA, -VELOCIDADE_MAXIMA);
-                    delay(DURACAO_KICK_ANTISTALL_MS);
-                    mover_motores(-VELOCIDADE_EXPLORACAO, -VELOCIDADE_EXPLORACAO);
-                }
-            }
-
-            // --- CONCLUSÃO DA RÉ PELA MÉDIA DOS DOIS ENCODERS ---
-            // Antes usava só contador_esq_A, presumindo as duas esteiras andando
-            // em sincronia — a mesma suposição frágil que causava giros
-            // incompletos. A média dos dois é a estimativa correta de quanto o
-            // CENTRO do robô andou, mesmo que uma esteira tenha avançado mais
-            // que a outra.
-            long delta_esq_re = (long)(contador_esq_A - posicao_inicial_explora);
-            long delta_dir_re = (long)(contador_dir_A - posicao_inicial_dir_explora);
-            float pulsos_percorridos_re = (fabs((float)delta_esq_re) + fabs((float)delta_dir_re)) / 2.0;
-
-            if (pulsos_percorridos_re >= alvoPulsosExplora) {
+        // Verifica conclusão do segmento baseado apenas no temporizador
+        if (millis() - tempo_inicio_manobra_explora >= alvoTempoExplora) {
+            if (estadoExplora == EXPLORA_RE) {
                 parar_motores(); delay(250); 
-                
-                // Sorteia a direção do giro (1 para Esquerda, -1 para Direita)
                 sentido_giro_atual = (random(0, 2) == 0) ? 1 : -1;
                 
-                // "Kickstart": um pulso curto em potência máxima antes de assentar
-                // na velocidade normal de giro. Partindo do zero, o atrito estático
-                // (stiction) de uma esteira pode ser maior que o da outra — com os
-                // dois lados na mesma potência "de cruzeiro", às vezes só a esteira
-                // com menos atrito solta e gira, e a outra fica presa derrapando no
-                // lugar (a causa provável do robô não completar o giro pedido).
-                // O pulso de potência máxima ajuda a vencer esse atrito nos dois
-                // lados antes de reduzir para a velocidade de giro sustentada.
                 mover_motores(-VELOCIDADE_MAXIMA * sentido_giro_atual, VELOCIDADE_MAXIMA * sentido_giro_atual);
                 delay(DURACAO_KICK_ANTISTALL_MS);
                 mover_motores(-VELOCIDADE_GIRO * sentido_giro_atual, VELOCIDADE_GIRO * sentido_giro_atual); 
                 
                 estadoExplora = EXPLORA_GIRO; 
-                posicao_inicial_explora = contador_esq_A; 
-                posicao_inicial_dir_explora = contador_dir_A;
-                giro_acumulado_rad = 0.0;
-                alvoAnguloGiroRad = PI / 2.0; // 90 graus
+                alvoTempoExplora = TEMPO_GIRO_90_MS;
                 tempo_inicio_manobra_explora = millis(); 
-                ultimo_check_stall_ms = millis();
-                ultima_contagem_esq_stall = contador_esq_A;
-                ultima_contagem_dir_stall = contador_dir_A;
-                Serial.printf("[GIRO] INICIO episodio: alvo=90 graus | sentido=%d | CM_POR_PULSO=%.4f LARGURA_ESTEIRA_EFETIVA=%.3f\n",
-                              sentido_giro_atual, CM_POR_PULSO, LARGURA_ESTEIRA_EFETIVA);
             }
-        } 
-        else if (estadoExplora == EXPLORA_GIRO) {
-
-            // --- VIGIA ANTI-DERRAPAGEM ---
-            // Se uma das esteiras não acumulou pulsos suficientes num intervalo
-            // curto enquanto a outra girou normalmente, essa esteira está
-            // patinando parada em vez de girar — exatamente o sintoma relatado
-            // ("às vezes ele só movimenta um dos motores"). Detectado isso,
-            // aplica-se um novo empurrão de potência máxima pra tentar destravá-la.
-            if (millis() - ultimo_check_stall_ms >= INTERVALO_CHECK_STALL_MS) {
-                unsigned long delta_esq_stall = contador_esq_A - ultima_contagem_esq_stall;
-                unsigned long delta_dir_stall = contador_dir_A - ultima_contagem_dir_stall;
-                ultima_contagem_esq_stall = contador_esq_A;
-                ultima_contagem_dir_stall = contador_dir_A;
-                ultimo_check_stall_ms = millis();
-
-                if (delta_esq_stall < PULSOS_MINIMOS_NAO_TRAVADO || delta_dir_stall < PULSOS_MINIMOS_NAO_TRAVADO) {
-                    if (ws.count() > 0) ws.textAll("{\"aviso\":\"esteira patinando no giro, reforcando torque\"}");
-                    Serial.printf("[GIRO][KICK] esteira patinando (delta_esq=%lu delta_dir=%lu em %lums) - reforcando torque. giro_acumulado=%.1f graus\n",
-                                  delta_esq_stall, delta_dir_stall, INTERVALO_CHECK_STALL_MS, giro_acumulado_rad * 180.0 / PI);
-                    mover_motores(-VELOCIDADE_MAXIMA * sentido_giro_atual, VELOCIDADE_MAXIMA * sentido_giro_atual);
-                    delay(DURACAO_KICK_ANTISTALL_MS);
-                    mover_motores(-VELOCIDADE_GIRO * sentido_giro_atual, VELOCIDADE_GIRO * sentido_giro_atual);
-                }
-            }
-
-            // --- DEBUG: progresso do giro em graus, ~5x/s ---
-            // Pulsos brutos de cada encoder desde o início DESTE segmento, e a
-            // conversão giro_acumulado_rad->graus, lado a lado. Serve pra
-            // calibrar LARGURA_ESTEIRA_EFETIVA/CM_POR_PULSO com dados reais:
-            // meça o giro físico de fato (ex. com um transferidor) e compare
-            // com "acumulado" no momento em que o robô parar.
-            static uint32_t timeout_debug_giro = 0;
-            if (millis() > timeout_debug_giro) {
-                long delta_esq_dbg = (long)(contador_esq_A - posicao_inicial_explora);
-                long delta_dir_dbg = (long)(contador_dir_A - posicao_inicial_dir_explora);
-                Serial.printf("[GIRO] acumulado=%.1f graus | alvo=%.1f graus | pulsos_esq=%ld pulsos_dir=%ld | sentido=%d | t_segmento=%lums\n",
-                              giro_acumulado_rad * 180.0 / PI, alvoAnguloGiroRad * 180.0 / PI,
-                              delta_esq_dbg, delta_dir_dbg, sentido_giro_atual,
-                              millis() - tempo_inicio_manobra_explora);
-                timeout_debug_giro = millis() + 200;
-            }
-
-            // --- CONCLUSÃO DO GIRO PELO HEADING MEDIDO (theta_rad), NÃO POR PULSO DE UMA RODA SÓ ---
-            // theta_rad é atualizado a partir da diferença entre os DOIS encoders
-            // (ver atualizar_odometria_fusao), então já reflete corretamente o
-            // quanto o robô girou de fato — mesmo que uma esteira tenha girado
-            // mais que a outra durante a manobra.
-            // giro_acumulado_rad soma o delta bruto a cada atualização de
-            // odometria (ver atualizar_odometria_fusao) e é zerado no início
-            // deste segmento — sem wraparound, então nenhuma volta inteira
-            // escondida dentro de um kick anti-derrapagem passa despercebida.
-            float girado_rad = fabs(giro_acumulado_rad);
-
-            if (girado_rad >= alvoAnguloGiroRad) {
-                Serial.printf("[GIRO] SEGMENTO CONCLUIDO: acumulado=%.1f graus (alvo era %.1f) | pulsos_esq=%ld pulsos_dir=%ld | t_segmento=%lums\n",
-                              girado_rad * 180.0 / PI, alvoAnguloGiroRad * 180.0 / PI,
-                              (long)(contador_esq_A - posicao_inicial_explora),
-                              (long)(contador_dir_A - posicao_inicial_dir_explora),
-                              millis() - tempo_inicio_manobra_explora);
+            else if (estadoExplora == EXPLORA_GIRO) {
                 parar_motores(); delay(100); giros_consecutivos++;
 
                 bool ainda_obstaculo = ((distancia > 0) && (distancia <= DISTANCIA_EXPLORACAO));
                 bool ainda_queda = (analogRead(SENSOR_LINHA_ESQUERDO) > LIMIAR_QUEDA) || (analogRead(SENSOR_LINHA_DIREITO) > LIMIAR_QUEDA);
 
                 if (ainda_obstaculo || ainda_queda) {
-                    // Prevenção de bloqueio: se girar demais e não sair, ele para.
-                    // Total de rotação até desistir = 90° (1ª tentativa) + 45° por
-                    // tentativa adicional. Com MAX_GIROS_CONSECUTIVOS=3, o teto é
-                    // 90+45+45=180° — no máximo meia-volta — em vez das 405° (mais
-                    // de uma volta completa) que o limite antigo de 8 permitia.
                     if (giros_consecutivos >= MAX_GIROS_CONSECUTIVOS) {
                         estadoExplora = EXPLORA_PARADO; if (ws.count() > 0) ws.textAll("{\"stuck\":true}"); 
                     } else {
-                        // Mantém a direção sorteada e tenta girar mais um pouco para se livrar do obstáculo
                         mover_motores(-VELOCIDADE_MAXIMA * sentido_giro_atual, VELOCIDADE_MAXIMA * sentido_giro_atual);
                         delay(DURACAO_KICK_ANTISTALL_MS);
                         mover_motores(-VELOCIDADE_GIRO * sentido_giro_atual, VELOCIDADE_GIRO * sentido_giro_atual); 
-                        posicao_inicial_explora = contador_esq_A; 
-                        posicao_inicial_dir_explora = contador_dir_A;
-                        giro_acumulado_rad = 0.0;
-                        alvoAnguloGiroRad = PI / 4.0; // 45 graus
+                        
+                        alvoTempoExplora = TEMPO_GIRO_45_MS;
                         tempo_inicio_manobra_explora = millis();
-                        ultimo_check_stall_ms = millis();
-                        ultima_contagem_esq_stall = contador_esq_A;
-                        ultima_contagem_dir_stall = contador_dir_A;
                         if (ainda_queda && !status_queda_ui_explora) { if (ws.count() > 0) ws.textAll("{\"fall\":true}"); status_queda_ui_explora = true; }
                     }
                 } else {
-                    // Caminho livre, volta a navegar em frente
                     estadoExplora = EXPLORA_LIVRE; giros_consecutivos = 0;
                     if (status_queda_ui_explora) { if (ws.count() > 0) ws.textAll("{\"fall\":false}"); status_queda_ui_explora = false; }
                     mover_motores(VELOCIDADE_EXPLORACAO, VELOCIDADE_EXPLORACAO);
@@ -1387,12 +1022,8 @@ void explora_casa() {
         if (queda_detectada && !status_queda_ui_explora) { if (ws.count() > 0) ws.textAll("{\"fall\":true}"); status_queda_ui_explora = true; }
         parar_motores(); delay(250); mover_motores(-VELOCIDADE_EXPLORACAO, -VELOCIDADE_EXPLORACAO);
         estadoExplora = EXPLORA_RE; giros_consecutivos = 0;
-        posicao_inicial_explora = contador_esq_A;
-        posicao_inicial_dir_explora = contador_dir_A;
-        alvoPulsosExplora = PULSOS_20_CM; tempo_inicio_manobra_explora = millis();
-        ultimo_check_stall_ms = millis();
-        ultima_contagem_esq_stall = contador_esq_A;
-        ultima_contagem_dir_stall = contador_dir_A;
+        alvoTempoExplora = TEMPO_RE_EXPLORA_MS;
+        tempo_inicio_manobra_explora = millis();
     } else {
         if (status_queda_ui_explora) { if (ws.count() > 0) ws.textAll("{\"fall\":false}"); status_queda_ui_explora = false; }
         mover_motores(VELOCIDADE_EXPLORACAO, VELOCIDADE_EXPLORACAO);
@@ -1414,7 +1045,6 @@ void navega_waypoints() {
   float target_lat = waypoints_lat[waypoint_atual_idx];
   float target_lon = waypoints_lon[waypoint_atual_idx];
 
-  //bool obstaculo_frente = wp_evita_colisao && (((distancia > 0) && (distancia <= DISTANCIA_OBSTACULO)) || obstaculo_virtual_detectado(DISTANCIA_OBSTACULO));
   bool obstaculo_frente = wp_evita_colisao && ((distancia > 0) && (distancia <= DISTANCIA_OBSTACULO));
   bool queda_detectada = wp_evita_queda && ((analogRead(SENSOR_LINHA_ESQUERDO) > LIMIAR_QUEDA) || (analogRead(SENSOR_LINHA_DIREITO) > LIMIAR_QUEDA));
 
@@ -1424,8 +1054,22 @@ void navega_waypoints() {
       return;
   }
 
-  // FASE 1: CALIBRAÇÃO DA BÚSSOLA GEOMÉTRICA
+  // FASE 1: CALIBRAÇÃO DA BÚSSOLA GEOMÉTRICA VIA GPS
+  float flat, flon; unsigned long age;
+  gps.f_get_position(&flat, &flon, &age);
+  
   if (!heading_gps_valido) {
+      if (flat != TinyGPS::GPS_INVALID_F_ANGLE) {
+          if (!registrou_inicio_calibracao) {
+              lat_inicio_calibracao = flat; lon_inicio_calibracao = flon; registrou_inicio_calibracao = true;
+          } else {
+              float dist_fisica_m = TinyGPS::distance_between(lat_inicio_calibracao, lon_inicio_calibracao, flat, flon);
+              if (dist_fisica_m >= 2.5) { // Espera andar 2.5 metros reais no GPS para calibrar a bússola
+                  float curso_calculado = TinyGPS::course_to(lat_inicio_calibracao, lon_inicio_calibracao, flat, flon);
+                  theta_rad = curso_calculado * PI / 180.0; heading_gps_valido = true; 
+              }
+          }
+      }
       mover_motores(VELOCIDADE_EXPLORACAO, VELOCIDADE_EXPLORACAO);
       if (ws.count() > 0) ws.textAll("{\"waypoint_status\":\"Calibrando Direcao...\"}");
       return; 
@@ -1463,9 +1107,6 @@ void navega_waypoints() {
   // FASE 3: NAVEGAÇÃO RETA CORRIGIDA POR GPS E FILTRO ANTI-STALL
   float curso_alvo = TinyGPS::course_to(estimativa_lat, estimativa_lon, target_lat, target_lon);
   
-  float flat, flon; unsigned long age;
-  gps.f_get_position(&flat, &flon, &age);
-  
   static float ant_lat = 0.0, ant_lon = 0.0;
   static int estado_motor_anterior = 0; 
 
@@ -1492,15 +1133,12 @@ void navega_waypoints() {
   if (erro_angular < -180.0) erro_angular += 360.0;
   if (erro_angular > 180.0) erro_angular -= 360.0;
 
-  // Tolerância relaxada para 50 graus. Ele aceita andar "torto" e corrigir em movimento.
   if (abs(erro_angular) > 50.0) {
       if (estado_motor_anterior == 0) { parar_motores(); delay(250); tempo_inicio_manobra_way = millis(); }
       estado_motor_anterior = 1;
 
-      // ANTI-STALL
       if (millis() - tempo_inicio_manobra_way > TIMEOUT_GIRO_WAYPOINT) {
           giros_consecutivos_way++;
-
           if (giros_consecutivos_way >= LIMITE_GIROS_ANTISTALL_WAYPOINT) {
               parar_motores();
               modo_waypoints = false;
@@ -1511,7 +1149,7 @@ void navega_waypoints() {
 
           if (ws.count() > 0) ws.textAll("{\"waypoint_status\":\"Anti-stall: forcando tracao reto\"}");
           parar_motores(); delay(150);
-          mover_motores(VELOCIDADE_MAXIMA, VELOCIDADE_MAXIMA); // Avanço com potência total para vencer o piso
+          mover_motores(VELOCIDADE_MAXIMA, VELOCIDADE_MAXIMA);
           delay(EMPURRAO_ANTISTALL_WAYPOINT_MS);
           parar_motores(); delay(150);
           estado_motor_anterior = 0;
@@ -1520,7 +1158,6 @@ void navega_waypoints() {
       }
 
       int sentido = (erro_angular > 0) ? 1 : -1;
-      // Reduzida a potência do giro no eixo (de 85 para 65) para as esteiras "morderem" o chão sem pular
       mover_motores(65 * sentido, -65 * sentido); 
   } else {
       if (estado_motor_anterior == 1) { parar_motores(); delay(250); }
@@ -1529,9 +1166,8 @@ void navega_waypoints() {
 
       int vel_esq = VELOCIDADE_EXPLORACAO; int vel_dir = VELOCIDADE_EXPLORACAO; 
       
-      // Curvas dinâmicas muito mais agressivas para compensar a folga dos 50 graus iniciais
       if (erro_angular > 12.0) { 
-          vel_dir = 35; // Freia bem mais a esteira de dentro da curva
+          vel_dir = 35;
           vel_esq = VELOCIDADE_MAXIMA; 
       } else if (erro_angular < -12.0) { 
           vel_esq = 35; 
@@ -1543,27 +1179,22 @@ void navega_waypoints() {
 
 // --------------------------------------------------
 void calcula_PID() {
-  // dt real entre chamadas, para I e D terem significado físico (e não dependerem
-  // de quantas vezes por segundo o loop() consegue chamar segue_linha()).
   unsigned long agora = millis();
   float dt = (pid_tempo_anterior == 0) ? 0.02 : (agora - pid_tempo_anterior) / 1000.0;
-  if (dt <= 0.0001) dt = 0.0001; // proteção contra divisão por ~zero
+  if (dt <= 0.0001) dt = 0.0001; 
   pid_tempo_anterior = agora;
 
   P = erro;
   I = I + (erro * dt);
   if (I > 50) I = 50; else if (I < -50) I = -50;
-  if (fabs(erro) < 0.05) I = 0; // zona morta: robô centralizado zera o acumulado
+  if (fabs(erro) < 0.05) I = 0; 
 
   D = (erro - erro_anterior) / dt;
-  if (D > 10.0) D = 10.0; else if (D < -10.0) D = -10.0; // evita picos do derivativo com dt muito pequeno
+  if (D > 10.0) D = 10.0; else if (D < -10.0) D = -10.0; 
 
   resposta_PID = (Kp * P) + (Ki * I) + (Kd * D);
   erro_anterior = erro;
 
-  // --- TRAVA DE SEGURANÇA ---
-  // Nunca deixa a resposta do PID ser forte a ponto de inverter o sentido de uma
-  // roda (isso é o que fazia o robô girar sobre o próprio eixo em vez de curvar).
   const float RESPOSTA_PID_MAX = VELOCIDADE - 5.0;
   if (resposta_PID > RESPOSTA_PID_MAX) resposta_PID = RESPOSTA_PID_MAX;
   if (resposta_PID < -RESPOSTA_PID_MAX) resposta_PID = -RESPOSTA_PID_MAX;
@@ -1585,18 +1216,11 @@ void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType 
   }
 }
 
-
-// Span mínimo entre o valor mais claro e o mais escuro vistos durante o giro
-// de calibração. Abaixo disso, a roleta de leitura não cruzou de fato a fita
-// (ex.: calibração feita inteira sobre o piso claro) e o limiar resultante
-// não representa a fronteira real fita/piso.
 const int LIMIAR_LINHA_SPAN_MINIMO = 500;
 
 void calibrarSensoresLinha() {
     modo_linha = false; modo_explora = false; modo_waypoints = false; parar_motores(); estadoManobraAtual = LIVRE; estadoExplora = EXPLORA_LIVRE; total_waypoints = 0;
 
-    // Média de várias amostras (em vez de uma leitura instantânea) para reduzir
-    // o efeito do ruído do ADC nesse valor de referência.
     long somaFundo = 0; const int N_AMOSTRAS_FUNDO = 10;
     for (int i = 0; i < N_AMOSTRAS_FUNDO; i++) {
         somaFundo += (analogRead(SENSOR_LINHA_ESQUERDO) + analogRead(SENSOR_LINHA_DIREITO)) / 2;
@@ -1618,23 +1242,10 @@ void calibrarSensoresLinha() {
     int span = maxVal - minVal;
     int novoLimiar = (minVal + maxVal) / 2;
 
-    // 1) O giro precisa ter cruzado fita e piso com contraste real. Se o span
-    //    for pequeno, a calibração provavelmente foi feita inteira sobre uma
-    //    única superfície (ex.: só piso claro, sem a fita embaixo) — nesse caso
-    //    NÃO sobrescrevemos a calibração/persistência anterior.
-    // 2) A leitura inicial (fundoInicial) precisa cair claramente para um dos
-    //    lados do novo limiar. Se estiver perto demais do meio do range, ela
-    //    não é confiável para decidir a polaridade (linha_escura) — sinal de
-    //    que o robô não começou de fato sobre a fita.
     bool span_ok = (span >= LIMIAR_LINHA_SPAN_MINIMO);
     bool fundo_ambiguo = abs(fundoInicial - novoLimiar) < (span / 4);
 
     if (!span_ok || fundo_ambiguo) {
-        Serial.printf("[CALIBRACAO] REJEITADA: min=%d max=%d span=%d fundoInicial=%d limiar_calc=%d "
-                      "(span_ok=%d fundo_ambiguo=%d). Posicione o robo COM os sensores sobre a fita "
-                      "antes de iniciar a calibracao.\n",
-                      minVal, maxVal, span, fundoInicial, novoLimiar, span_ok, fundo_ambiguo);
-
         JsonDocument json;
         json["status"] = "calibracao_falhou";
         json["motivo"] = !span_ok ? "contraste_insuficiente" : "fundo_ambiguo";
@@ -1646,9 +1257,6 @@ void calibrarSensoresLinha() {
 
     limiarLinha = novoLimiar;
     linha_escura = (fundoInicial < limiarLinha);
-
-    Serial.printf("[CALIBRACAO] OK: min=%d max=%d span=%d fundoInicial=%d limiar=%d linha_escura=%d\n",
-                  minVal, maxVal, span, fundoInicial, limiarLinha, linha_escura);
 
     SPIFFS.begin(DIRETORIO_SPIFFS, false); SPIFFS.putInt("limiar", limiarLinha); SPIFFS.putBool("linha_escura", linha_escura); SPIFFS.end();
 
