@@ -123,6 +123,9 @@ const char *ALIAS_WAYPOINT = "waypoint";
 bool change_wifi_flag = false;
 String new_wifi_ssid = "";
 String new_wifi_pass = "";
+bool wifi_conectando = false;
+uint32_t tempo_inicio_wifi = 0;
+const uint32_t TIMEOUT_WIFI_CONNECT_MS = 15000;
 
 VespaMotors motores;
 VespaBattery vbat;
@@ -172,6 +175,35 @@ bool modo_explora = false;
 
 enum EstadoManobra { LIVRE, MANOBRA_QUEDA_RE, MANOBRA_QUEDA_GIRO, MANOBRA_PAREDE_RE, MANOBRA_PAREDE_GIRO };
 EstadoManobra estadoManobraAtual = LIVRE;
+
+// --- MÁQUINA DE ESTADOS: DESVIO DE OBSTÁCULO NO MODO LINHA ---
+// Sequência: gira p/ fora da linha -> avança de lado -> gira p/ ficar paralelo ->
+// avança paralelo (passa do objeto) -> gira de volta em direção à linha -> procura a linha
+enum EstadoDesvioLinha {
+  DESVIO_LINHA_LIVRE,
+  DESVIO_GIRO_SAIDA,
+  DESVIO_AVANCA_LADO,
+  DESVIO_GIRO_RETORNO,
+  DESVIO_AVANCA_PARALELO,
+  DESVIO_GIRO_LINHA,
+  DESVIO_PROCURA_LINHA
+};
+EstadoDesvioLinha estadoDesvioLinha = DESVIO_LINHA_LIVRE;
+uint32_t tempo_inicio_desvio = 0;
+uint32_t alvoTempoDesvio = 0;
+int sentido_desvio = 1; // 1 = contorna pela direita, -1 = contorna pela esquerda
+int tentativas_desvio_consecutivas = 0;
+const int MAX_TENTATIVAS_DESVIO = 3;
+
+const int DISTANCIA_OBSTACULO_LINHA = 20;          // cm - gatilho para iniciar o desvio durante o modo_linha
+//const uint32_t TEMPO_GIRO_DESVIO_MS = 550;         // tempo de giro (~45°) em cada etapa do desvio
+const uint32_t TEMPO_GIRO_DESVIO_MS = 1100;
+
+//const uint32_t TEMPO_AVANCO_LADO_MS = 600;         // avanço lateral suficiente para ultrapassar a lateral do objeto
+const uint32_t TEMPO_AVANCO_LADO_MS = 900;         // avanço lateral suficiente para ultrapassar a lateral do objeto
+//const uint32_t TEMPO_AVANCO_PARALELO_MS = 900;     // avanço paralelo à linha, cobrindo o comprimento do objeto
+const uint32_t TEMPO_AVANCO_PARALELO_MS = 1200;     // avanço paralelo à linha, cobrindo o comprimento do objeto
+const uint32_t TEMPO_MAX_PROCURA_LINHA_MS = 3000;  // tempo máximo procurando reencontrar a linha antes de declarar "stuck"
 
 // --- MÁQUINA DE ESTADOS EXPLORAÇÃO (Baseada em Tempo) ---
 enum EstadoExploracao { EXPLORA_LIVRE, EXPLORA_RE, EXPLORA_GIRO, EXPLORA_PARADO };
@@ -235,6 +267,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         .btn-warning { background-color: #f0be00; border-color: #f0be00; color: #000; font-weight: bold; }
         .setup-title { font-size: 20px; font-weight: bold; color: #333; width: 100%; text-align: center; margin-bottom: 15px; display: block; }   
         
+        #canvas_joystick { touch-action: none; }
         #map { height: 500px; width: 100%; border-radius: 8px; }
         .setup-container { display: flex; align-items: flex-start; justify-content: space-evenly; align-content: flex-start; flex-direction: row; flex-wrap: wrap; padding: 20px; }
         .setup-box { width: 100%; max-width: 320px; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); margin-bottom: 20px; }
@@ -329,6 +362,11 @@ const char index_html[] PROGMEM = R"rawliteral(
             </div>
             <div class="setup-box">
                 <span class="setup-title">Line Calibration</span>
+                <div style="display:flex; justify-content:center; gap:14px; margin-bottom:14px; font-size:14px;">
+                    <label><input type="radio" name="lineType" value="auto" checked> Auto</label>
+                    <label><input type="radio" name="lineType" value="escura"> Linha Escura</label>
+                    <label><input type="radio" name="lineType" value="clara"> Linha Clara</label>
+                </div>
                 <button type="button" class="btn btn-warning" onclick="calibrarSensores()">Calibrate Sensors</button>
                 <div id="statusCalibracao" style="margin-top: 10px; font-weight: bold; text-align:center; color: #4CAF50;"></div>
             </div>
@@ -337,6 +375,7 @@ const char index_html[] PROGMEM = R"rawliteral(
                 <div class="input-group"><div class="input-group-addon">SSID</div><input type="text" id="wifi_ssid" placeholder="Network name" class="input"></div>
                 <div class="input-group"><div class="input-group-addon">Pass</div><input type="password" id="wifi_pass" placeholder="Network password" class="input"></div>
                 <button type="button" class="btn btn-warning" onclick="send_wifi()">Connect</button>
+                <div id="statusWifi" style="margin-top: 10px; font-weight: bold; text-align:center; color: #666;"></div>
             </div>
         </div>
     </div>
@@ -344,7 +383,24 @@ const char index_html[] PROGMEM = R"rawliteral(
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" defer></script>
     <script>
         function safelySend(dataObj) { if (connection && connection.readyState === WebSocket.OPEN) { connection.send(JSON.stringify(dataObj)); } }
-        function calibrarSensores() { document.getElementById('statusCalibracao').innerText = "Calibrating..."; document.getElementById('statusCalibracao').style.color = "#f0be00"; safelySend({ cmd: "calibrate_line" }); }
+        function calibrarSensores() {
+            document.getElementById('statusCalibracao').innerText = "Calibrating...";
+            document.getElementById('statusCalibracao').style.color = "#f0be00";
+            let tipo = document.querySelector('input[name="lineType"]:checked').value;
+            let payload = { cmd: "calibrate_line" };
+            if (tipo === "escura") payload.forcar_escura = true;
+            else if (tipo === "clara") payload.forcar_escura = false;
+            safelySend(payload);
+        }
+
+        function send_wifi() {
+            let ssid = document.getElementById("wifi_ssid").value.trim();
+            let pass = document.getElementById("wifi_pass").value;
+            if (!ssid) { alert("Digite o nome da rede (SSID)."); return; }
+            document.getElementById('statusWifi').innerText = "Conectando...";
+            document.getElementById('statusWifi').style.color = "#f0be00";
+            safelySend({ wifi_ssid: ssid, wifi_pass: pass });
+        }
 
         let lat = null, lon = null, lastMapUpdate = 0, map = null, marcador = null;
         let wp_queda = true, wp_colisao = true;
@@ -418,7 +474,21 @@ const char index_html[] PROGMEM = R"rawliteral(
 
             if (data["distancia"]) document.getElementById("distance").innerText = (data["distancia"]).toFixed(0);
             if (data["robot_speed"] !== undefined) document.getElementById("robot-speed").innerText = data["robot_speed"].toFixed(1);
-            if (data["fall"] !== undefined) { document.getElementById("fall-status-text").innerText = data["fall"] ? "Fall Detected" : ""; }
+            if (data["fall"] !== undefined) {
+                let fallEl = document.getElementById("fall-status-text");
+                fallEl.innerText = data["fall"] ? "Fall Detected" : "";
+                fallEl.style.color = data["fall"] ? "#f44336" : "#ccc";
+            }
+            if (data["stuck"] !== undefined) {
+                let stuckEl = document.getElementById("stuck-status-text");
+                stuckEl.innerText = data["stuck"] ? "Stuck!" : "";
+                stuckEl.style.color = data["stuck"] ? "#f44336" : "#ccc";
+            }
+            if (data["line_status"]) {
+                let lineEl = document.getElementById("stuck-status-text");
+                lineEl.innerText = data["line_status"];
+                lineEl.style.color = data["line_status"].toLowerCase().includes("reencontrada") ? "#4CAF50" : "#FFA500";
+            }
             if (data["waypoint_status"]) {
                 let textStatus = data["waypoint_status"];
                 document.getElementById("waypoint_status").innerText = "Status: " + textStatus;
@@ -440,11 +510,15 @@ const char index_html[] PROGMEM = R"rawliteral(
                 document.getElementById('statusCalibracao').innerText = "OK! Limiar: " + data["limiar"] + " (" + corDetectada + ")";
                 document.getElementById('statusCalibracao').style.color = "#4CAF50";
             }
+            if (data["wifi_status"]) {
+                document.getElementById('statusWifi').innerText = data["wifi_status"];
+                document.getElementById('statusWifi').style.color = data["wifi_status"].toLowerCase().includes("falh") ? "#e53935" : "#4CAF50";
+            }
             if (data["status"] === "calibracao_falhou") {
                 let motivoTexto = (data["motivo"] === "fundo_ambiguo")
                     ? "leitura inicial ambigua"
                     : "contraste insuficiente";
-                document.getElementById('statusCalibracao').innerText = "Calibration rejected! (" + motivoTexto + ") Posicione o robo sobre a fita e tente de novo.";
+                document.getElementById('statusCalibracao').innerText = "Calibration rejected! (" + motivoTexto + ") Deixe os 2 sensores sobre a fita, centralizados, e tente de novo.";
                 document.getElementById('statusCalibracao').style.color = "#e53935";
             }
         };
@@ -479,9 +553,12 @@ const char index_html[] PROGMEM = R"rawliteral(
         function initJoystick() {
             canvas_joystick = document.getElementById('canvas_joystick'); if (!canvas_joystick) return;
             ctx_joystick = canvas_joystick.getContext('2d'); resize();
-            ['mousedown','touchstart'].forEach(evt => canvas_joystick.addEventListener(evt, startDrawing));
-            ['mouseup','touchend','touchcancel'].forEach(evt => canvas_joystick.addEventListener(evt, stopDrawing));
-            ['mousemove','touchmove'].forEach(evt => canvas_joystick.addEventListener(evt, Draw));
+            ['mousedown'].forEach(evt => canvas_joystick.addEventListener(evt, startDrawing));
+            ['touchstart'].forEach(evt => canvas_joystick.addEventListener(evt, startDrawing, { passive: false }));
+            ['mouseup'].forEach(evt => canvas_joystick.addEventListener(evt, stopDrawing));
+            ['touchend','touchcancel'].forEach(evt => canvas_joystick.addEventListener(evt, stopDrawing, { passive: false }));
+            ['mousemove'].forEach(evt => canvas_joystick.addEventListener(evt, Draw));
+            ['touchmove'].forEach(evt => canvas_joystick.addEventListener(evt, Draw, { passive: false }));
             window.addEventListener('resize', resize);
         }
         if (document.readyState === 'loading') { document.addEventListener('DOMContentLoaded', () => { initJoystick(); }); } else { initJoystick(); }
@@ -521,11 +598,12 @@ const char index_html[] PROGMEM = R"rawliteral(
             }
         }
 
-        function startDrawing(event) { paint = true; document.activeElement.blur(); resetModosAutonomosVisual(); getPosition_joystick(event); if (in_circle()) { joystick(coord.x, coord.y); Draw(event); } }
-        function stopDrawing() { paint = false; joystick(origin_joystick.x, origin_joystick.y); document.getElementById("speed").innerText = 0; document.getElementById("table-speed").innerText = 0; if (movimento == 1) { safelySend({"velocidade":0, "angulo":0}); movimento = 0; } resetModosAutonomosVisual(); }
+        function startDrawing(event) { if (event.cancelable) event.preventDefault(); paint = true; document.activeElement.blur(); resetModosAutonomosVisual(); getPosition_joystick(event); if (in_circle()) { joystick(coord.x, coord.y); Draw(event); } }
+        function stopDrawing(event) { if (event && event.cancelable) event.preventDefault(); paint = false; joystick(origin_joystick.x, origin_joystick.y); document.getElementById("speed").innerText = 0; document.getElementById("table-speed").innerText = 0; if (movimento == 1) { safelySend({"velocidade":0, "angulo":0}); movimento = 0; } resetModosAutonomosVisual(); }
 
         function Draw(event) {
             if (paint) {
+                if (event.cancelable) event.preventDefault();
                 getPosition_joystick(event);
                 var angle = Math.atan2((coord.y - origin_joystick.y), (coord.x - origin_joystick.x)), x, y;
                 if (in_circle()) { x = coord.x - radius / 2; y = coord.y - radius / 2; } else { x = radius * radius_factor * Math.cos(angle) + origin_joystick.x; y = radius * radius_factor * Math.sin(angle) + origin_joystick.y; }
@@ -552,9 +630,10 @@ void atualizar_sensor_ultrassonico(void);
 void onEvent(AsyncWebSocket *, AsyncWebSocketClient *, AwsEventType, void *, uint8_t *, size_t);
 void calcula_PID(void);
 void segue_linha(void);
+void executa_desvio_obstaculo_linha(void);
 void explora_casa(void);
 void navega_waypoints(void);
-void calibrarSensoresLinha(void);
+void calibrarSensoresLinha(bool forcarPolaridade, bool valorForcado);
 void verificarSegurancaBateria(void);
 void processar_mapeamento_e_telemetria(void);
 void carregar_mapa_salvo(void);
@@ -628,7 +707,18 @@ void setup() {
   Kd = SPIFFS.getFloat(ENDERECOS_SPIFFS[3], 0.4);
   limiarLinha = SPIFFS.getInt("limiar", 3000); 
   linha_escura = SPIFFS.getBool("linha_escura", true);
+  String saved_wifi_ssid = SPIFFS.getString("wifi_ssid_sta", "");
+  String saved_wifi_pass = SPIFFS.getString("wifi_pass_sta", "");
   SPIFFS.end();
+
+  // Tenta reconectar a uma rede Wi-Fi salva anteriormente pelo dashboard (opcional)
+  if (saved_wifi_ssid.length() > 0) {
+      WiFi.mode(WIFI_AP_STA); // AP do robo continua ativo mesmo se essa conexao falhar
+      WiFi.begin(saved_wifi_ssid.c_str(), saved_wifi_pass.c_str());
+      uint32_t inicio_wifi_boot = millis();
+      while (WiFi.status() != WL_CONNECTED && millis() - inicio_wifi_boot < 8000) { delay(200); }
+      if (WiFi.status() != WL_CONNECTED) { WiFi.mode(WIFI_AP); }
+  }
 
   memset(occupancyMap, 0, sizeof(occupancyMap));
 }
@@ -648,6 +738,35 @@ void loop() {
 
   static uint32_t ultimoCheckBateria = 0;
   if (millis() - ultimoCheckBateria > 2000) { ultimoCheckBateria = millis(); verificarSegurancaBateria(); }
+
+  // --- CONEXAO A REDE WI-FI EXTERNA (nao bloqueia o restante do loop) ---
+  if (change_wifi_flag) {
+      change_wifi_flag = false;
+      WiFi.mode(WIFI_AP_STA); // mantem o AP do robo ativo enquanto tenta conectar como estacao
+      WiFi.begin(new_wifi_ssid.c_str(), new_wifi_pass.c_str());
+      wifi_conectando = true;
+      tempo_inicio_wifi = millis();
+      if (ws.count() > 0) ws.textAll("{\"wifi_status\":\"Conectando a rede...\"}");
+  }
+
+  if (wifi_conectando) {
+      if (WiFi.status() == WL_CONNECTED) {
+          wifi_conectando = false;
+          String ip = WiFi.localIP().toString();
+          char msgWifi[96];
+          snprintf(msgWifi, sizeof(msgWifi), "{\"wifi_status\":\"Conectado! IP: %s\"}", ip.c_str());
+          if (ws.count() > 0) ws.textAll(msgWifi);
+
+          SPIFFS.begin(DIRETORIO_SPIFFS, false);
+          SPIFFS.putString("wifi_ssid_sta", new_wifi_ssid);
+          SPIFFS.putString("wifi_pass_sta", new_wifi_pass);
+          SPIFFS.end();
+      } else if (millis() - tempo_inicio_wifi > TIMEOUT_WIFI_CONNECT_MS) {
+          wifi_conectando = false;
+          WiFi.mode(WIFI_AP); // desiste e volta a operar apenas como ponto de acesso
+          if (ws.count() > 0) ws.textAll("{\"wifi_status\":\"Falha ao conectar - verifique SSID/senha\"}");
+      }
+  }
 
   if (modoSegurancaBateria) {
       modo_linha = false; modo_explora = false; modo_waypoints = false;
@@ -842,7 +961,10 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t length) {
     data[length] = 0;
 
     if (strstr(reinterpret_cast<char *>(data), "calibrate_line") != nullptr) {
-      calibrarSensoresLinha();
+      JsonDocument json; deserializeJson(json, data, length);
+      bool forcarPolaridade = json.containsKey("forcar_escura");
+      bool valorForcado = forcarPolaridade ? json["forcar_escura"].as<bool>() : true;
+      calibrarSensoresLinha(forcarPolaridade, valorForcado);
     }
     else if (strstr(reinterpret_cast<char *>(data), ALIAS_WAYPOINT) != nullptr) {
       JsonDocument json; deserializeJson(json, data, length);
@@ -866,6 +988,14 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t length) {
           parar_motores(); total_waypoints = 0;
       }
     }
+    else if (strstr(reinterpret_cast<char *>(data), ALIAS_WIFI_SSID) != nullptr) {
+        JsonDocument json; deserializeJson(json, data, length);
+        if (json.containsKey(ALIAS_WIFI_SSID)) {
+            new_wifi_ssid = json[ALIAS_WIFI_SSID].as<String>();
+            new_wifi_pass = json.containsKey(ALIAS_WIFI_PASS) ? json[ALIAS_WIFI_PASS].as<String>() : "";
+            change_wifi_flag = true;
+        }
+    }
     else if (strstr(reinterpret_cast<char *>(data), "wp_queda") != nullptr) {
         JsonDocument json; deserializeJson(json, data, length);
         if(json.containsKey("wp_queda")) wp_evita_queda = json["wp_queda"].as<bool>();
@@ -876,17 +1006,17 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t length) {
       if (json.containsKey(ALIAS_LINHA)) modo_linha = json[ALIAS_LINHA].as<bool>();
       if (json.containsKey(ALIAS_EXPLORA)) modo_explora = json[ALIAS_EXPLORA].as<bool>();
       
-      if (modo_linha) { modo_explora = false; modo_waypoints = false; erro = 0.0; I = 0.0; erro_anterior = 0.0; contador_parada = 0; leitura_esquerda_filtrada = 0.0; leitura_direita_filtrada = 0.0; pid_tempo_anterior = 0; }
+      if (modo_linha) { modo_explora = false; modo_waypoints = false; erro = 0.0; I = 0.0; erro_anterior = 0.0; contador_parada = 0; leitura_esquerda_filtrada = 0.0; leitura_direita_filtrada = 0.0; pid_tempo_anterior = 0; estadoDesvioLinha = DESVIO_LINHA_LIVRE; tentativas_desvio_consecutivas = 0; }
       else if (modo_explora) { modo_linha = false; modo_waypoints = false; }
 
       if (!modo_linha && !modo_explora && !modo_waypoints) {
-        parar_motores(); estadoManobraAtual = LIVRE; estadoExplora = EXPLORA_LIVRE; ws.textAll("{\"fall\":false, \"stuck\":false}"); 
+        parar_motores(); estadoManobraAtual = LIVRE; estadoExplora = EXPLORA_LIVRE; estadoDesvioLinha = DESVIO_LINHA_LIVRE; ws.textAll("{\"fall\":false, \"stuck\":false}"); 
       }
     }
     else if (strstr(reinterpret_cast<char *>(data), ALIAS_VELOCIDADE) != nullptr) {
       if (modo_linha || modo_explora || modo_waypoints) {
         modo_linha = false; modo_explora = false; modo_waypoints = false; total_waypoints = 0;
-        parar_motores(); estadoManobraAtual = LIVRE; estadoExplora = EXPLORA_LIVRE;
+        parar_motores(); estadoManobraAtual = LIVRE; estadoExplora = EXPLORA_LIVRE; estadoDesvioLinha = DESVIO_LINHA_LIVRE;
         ws.textAll("{\"fall\":false, \"stuck\":false, \"waypoint_status\":\"Cancelado pelo Joystick\"}"); 
       }
       controlar_motor(data, length);
@@ -926,6 +1056,34 @@ void atualizar_sensor_ultrassonico(void) {
 
 // --------------------------------------------------
 void segue_linha() {
+  // --- Se já está executando a manobra de desvio, continua ela e sai ---
+  if (estadoDesvioLinha != DESVIO_LINHA_LIVRE) {
+      executa_desvio_obstaculo_linha();
+      return;
+  }
+
+  // --- Detecção de obstáculo à frente durante o seguimento de linha ---
+  bool obstaculo_frente = (distancia > 0) && (distancia <= DISTANCIA_OBSTACULO_LINHA);
+  if (obstaculo_frente) {
+      if (tentativas_desvio_consecutivas >= MAX_TENTATIVAS_DESVIO) {
+          // Já tentou desviar várias vezes seguidas sem sucesso: para e avisa
+          parar_motores();
+          if (ws.count() > 0) ws.textAll("{\"line_status\":\"Obstaculo persistente - travado\", \"stuck\":true}");
+          return;
+      }
+
+      parar_motores();
+      delay(150);
+      if (ws.count() > 0) ws.textAll("{\"line_status\":\"Obstaculo detectado - contornando\"}");
+
+      sentido_desvio = 1; // contorna sempre pela direita (poderia alternar se preferir)
+      mover_motores(VELOCIDADE_GIRO * sentido_desvio, -VELOCIDADE_GIRO * sentido_desvio);
+      estadoDesvioLinha = DESVIO_GIRO_SAIDA;
+      alvoTempoDesvio = TEMPO_GIRO_DESVIO_MS;
+      tempo_inicio_desvio = millis();
+      return;
+  }
+
   leitura_esquerdo = analogRead(SENSOR_LINHA_ESQUERDO); 
   leitura_direito = analogRead(SENSOR_LINHA_DIREITO);
 
@@ -964,6 +1122,117 @@ void segue_linha() {
       mover_motores(velocidade_esquerda, velocidade_direita);
   }
   delay(espera);
+}
+
+// --------------------------------------------------
+// Executa, passo a passo e sem bloquear o loop (baseada em millis()), a manobra
+// de contornar um obstáculo detectado durante o modo_linha e retornar à linha.
+void executa_desvio_obstaculo_linha() {
+
+  // Durante a etapa de "procura", verifica a cada iteração se a linha já foi reencontrada
+  if (estadoDesvioLinha == DESVIO_PROCURA_LINHA) {
+      int leituraEsq = analogRead(SENSOR_LINHA_ESQUERDO);
+      int leituraDir = analogRead(SENSOR_LINHA_DIREITO);
+      bool linha_encontrada = linha_escura
+          ? (leituraEsq >= limiarLinha || leituraDir >= limiarLinha)
+          : (leituraEsq <= limiarLinha || leituraDir <= limiarLinha);
+
+      if (linha_encontrada) {
+          parar_motores();
+          estadoDesvioLinha = DESVIO_LINHA_LIVRE;
+          tentativas_desvio_consecutivas = 0;
+          // Reseta o PID para retomar o seguimento de forma suave
+          erro = 0.0; I = 0.0; erro_anterior = 0.0; contador_parada = 0;
+          leitura_esquerda_filtrada = 0.0; leitura_direita_filtrada = 0.0; pid_tempo_anterior = 0;
+          if (ws.count() > 0) ws.textAll("{\"line_status\":\"Linha reencontrada\"}");
+          return;
+      }
+  }
+
+  // Durante os avanços, se surgir outro obstáculo bem próximo, pausa até ele se afastar —
+  // mas com um limite de tempo, para nunca travar o robô para sempre caso o objeto não se
+  // afaste (ex.: o próprio obstáculo original ainda dentro do alcance do sensor após o giro).
+  static uint32_t tempo_inicio_pausa_seguranca = 0;
+  bool bloqueio_proximo = (estadoDesvioLinha == DESVIO_AVANCA_LADO || estadoDesvioLinha == DESVIO_AVANCA_PARALELO) &&
+      distancia > 0 && distancia <= (DISTANCIA_OBSTACULO_LINHA / 3);
+
+  if (bloqueio_proximo) {
+      if (tempo_inicio_pausa_seguranca == 0) tempo_inicio_pausa_seguranca = millis();
+      parar_motores();
+
+      const uint32_t TIMEOUT_PAUSA_SEGURANCA_MS = 1500;
+      if (millis() - tempo_inicio_pausa_seguranca > TIMEOUT_PAUSA_SEGURANCA_MS) {
+          // Ficou bloqueado por tempo demais: desiste desta tentativa de desvio,
+          // devolve o controle a segue_linha() para reavaliar (ou tentar de novo)
+          estadoDesvioLinha = DESVIO_LINHA_LIVRE;
+          tentativas_desvio_consecutivas++;
+          tempo_inicio_pausa_seguranca = 0;
+          if (ws.count() > 0) ws.textAll("{\"line_status\":\"Desvio bloqueado - reavaliando\", \"stuck\":true}");
+      }
+      return;
+  } else {
+      tempo_inicio_pausa_seguranca = 0;
+  }
+
+  // Ainda dentro do tempo da etapa atual: nada a fazer, continua o movimento em curso
+  if (millis() - tempo_inicio_desvio < alvoTempoDesvio) return;
+
+  parar_motores();
+  delay(100);
+
+  switch (estadoDesvioLinha) {
+      case DESVIO_GIRO_SAIDA:
+          // Já girou para fora da linha; agora avança de lado para passar da lateral do objeto
+          mover_motores(VELOCIDADE_EXPLORACAO, VELOCIDADE_EXPLORACAO);
+          estadoDesvioLinha = DESVIO_AVANCA_LADO;
+          alvoTempoDesvio = TEMPO_AVANCO_LADO_MS;
+          tempo_inicio_desvio = millis();
+          break;
+
+      case DESVIO_AVANCA_LADO:
+          // Gira de volta, ficando de frente paralela à linha original (objeto ao lado)
+          mover_motores(-VELOCIDADE_GIRO * sentido_desvio, VELOCIDADE_GIRO * sentido_desvio);
+          estadoDesvioLinha = DESVIO_GIRO_RETORNO;
+          alvoTempoDesvio = TEMPO_GIRO_DESVIO_MS;
+          tempo_inicio_desvio = millis();
+          break;
+
+      case DESVIO_GIRO_RETORNO:
+          // Avança paralelo à linha, cobrindo o comprimento do objeto
+          mover_motores(VELOCIDADE_EXPLORACAO, VELOCIDADE_EXPLORACAO);
+          estadoDesvioLinha = DESVIO_AVANCA_PARALELO;
+          alvoTempoDesvio = TEMPO_AVANCO_PARALELO_MS;
+          tempo_inicio_desvio = millis();
+          break;
+
+      case DESVIO_AVANCA_PARALELO:
+          // Gira de volta em direção à linha
+          mover_motores(-VELOCIDADE_GIRO * sentido_desvio, VELOCIDADE_GIRO * sentido_desvio);
+          estadoDesvioLinha = DESVIO_GIRO_LINHA;
+          alvoTempoDesvio = TEMPO_GIRO_DESVIO_MS;
+          tempo_inicio_desvio = millis();
+          break;
+
+      case DESVIO_GIRO_LINHA:
+          // Avança devagar procurando reencontrar a linha (verificado no topo da função)
+          mover_motores(VELOCIDADE, VELOCIDADE);
+          estadoDesvioLinha = DESVIO_PROCURA_LINHA;
+          alvoTempoDesvio = TEMPO_MAX_PROCURA_LINHA_MS;
+          tempo_inicio_desvio = millis();
+          break;
+
+      case DESVIO_PROCURA_LINHA:
+          // Esgotou o tempo máximo de procura sem reencontrar a linha
+          parar_motores();
+          estadoDesvioLinha = DESVIO_LINHA_LIVRE;
+          tentativas_desvio_consecutivas++;
+          if (ws.count() > 0) ws.textAll("{\"line_status\":\"Linha nao encontrada apos desvio\", \"stuck\":true}");
+          break;
+
+      default:
+          estadoDesvioLinha = DESVIO_LINHA_LIVRE;
+          break;
+  }
 }
 
 // --------------------------------------------------
@@ -1209,7 +1478,7 @@ void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType 
     case WS_EVT_CONNECT: digitalWrite(PINO_LED, HIGH); break;
     case WS_EVT_DISCONNECT:
         if (ws.count() == 0) {
-          digitalWrite(PINO_LED, LOW); modo_linha = false; modo_explora = false; modo_waypoints = false; parar_motores(); estadoManobraAtual = LIVRE; estadoExplora = EXPLORA_LIVRE; total_waypoints = 0;
+          digitalWrite(PINO_LED, LOW); modo_linha = false; modo_explora = false; modo_waypoints = false; parar_motores(); estadoManobraAtual = LIVRE; estadoExplora = EXPLORA_LIVRE; estadoDesvioLinha = DESVIO_LINHA_LIVRE; total_waypoints = 0;
         } break;
     case WS_EVT_DATA: handleWebSocketMessage(arg, data, length); break;
     case WS_EVT_PONG: case WS_EVT_ERROR: break;
@@ -1218,8 +1487,10 @@ void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType 
 
 const int LIMIAR_LINHA_SPAN_MINIMO = 500;
 
-void calibrarSensoresLinha() {
-    modo_linha = false; modo_explora = false; modo_waypoints = false; parar_motores(); estadoManobraAtual = LIVRE; estadoExplora = EXPLORA_LIVRE; total_waypoints = 0;
+// forcarPolaridade = true: usuário escolheu manualmente "Linha Escura"/"Linha Clara" (valorForcado),
+// ignorando a leitura inicial ambígua. forcarPolaridade = false: modo Auto (tenta adivinhar pela leitura inicial).
+void calibrarSensoresLinha(bool forcarPolaridade, bool valorForcado) {
+    modo_linha = false; modo_explora = false; modo_waypoints = false; parar_motores(); estadoManobraAtual = LIVRE; estadoExplora = EXPLORA_LIVRE; estadoDesvioLinha = DESVIO_LINHA_LIVRE; total_waypoints = 0;
 
     long somaFundo = 0; const int N_AMOSTRAS_FUNDO = 10;
     for (int i = 0; i < N_AMOSTRAS_FUNDO; i++) {
@@ -1230,8 +1501,11 @@ void calibrarSensoresLinha() {
 
     int minVal = 4095; int maxVal = 0; uint32_t inicio = millis();
 
-    while (millis() - inicio < 2500) {
-        if (((millis() - inicio) / 250) % 2 == 0) mover_motores(60, -60); else mover_motores(-60, 60);
+    // Varredura mais longa e com bursts maiores (400ms em vez de 250ms) para dar tempo real de
+    // deslocamento aos motores e aumentar a chance dos sensores cruzarem a borda da fita mesmo
+    // que o robô não esteja perfeitamente centralizado nela.
+    while (millis() - inicio < 3500) {
+        if (((millis() - inicio) / 400) % 2 == 0) mover_motores(65, -65); else mover_motores(-65, 65);
         int leituraEsq = analogRead(SENSOR_LINHA_ESQUERDO); int leituraDir = analogRead(SENSOR_LINHA_DIREITO);
         if (leituraEsq < minVal) minVal = leituraEsq; if (leituraDir < minVal) minVal = leituraDir;
         if (leituraEsq > maxVal) maxVal = leituraEsq; if (leituraDir > maxVal) maxVal = leituraDir;
@@ -1243,7 +1517,10 @@ void calibrarSensoresLinha() {
     int novoLimiar = (minVal + maxVal) / 2;
 
     bool span_ok = (span >= LIMIAR_LINHA_SPAN_MINIMO);
-    bool fundo_ambiguo = abs(fundoInicial - novoLimiar) < (span / 4);
+    // A checagem de "fundo ambíguo" só faz sentido no modo Auto: ela existe para evitar confiar
+    // numa leitura inicial que não deixa claro se o robô começou em cima da linha ou do fundo.
+    // Quando o usuário força a polaridade manualmente, essa leitura é irrelevante.
+    bool fundo_ambiguo = (!forcarPolaridade) && (abs(fundoInicial - novoLimiar) < (span / 4));
 
     if (!span_ok || fundo_ambiguo) {
         JsonDocument json;
@@ -1256,7 +1533,7 @@ void calibrarSensoresLinha() {
     }
 
     limiarLinha = novoLimiar;
-    linha_escura = (fundoInicial < limiarLinha);
+    linha_escura = forcarPolaridade ? valorForcado : (fundoInicial < limiarLinha);
 
     SPIFFS.begin(DIRETORIO_SPIFFS, false); SPIFFS.putInt("limiar", limiarLinha); SPIFFS.putBool("linha_escura", linha_escura); SPIFFS.end();
 
@@ -1274,7 +1551,7 @@ void verificarSegurancaBateria() {
         leituras_criticas_consecutivas++;
         if (leituras_criticas_consecutivas >= 3) {
             if (!modoSegurancaBateria) {
-                modoSegurancaBateria = true; modo_linha = false; modo_explora = false; modo_waypoints = false; parar_motores(); estadoManobraAtual = LIVRE; estadoExplora = EXPLORA_LIVRE; total_waypoints = 0;
+                modoSegurancaBateria = true; modo_linha = false; modo_explora = false; modo_waypoints = false; parar_motores(); estadoManobraAtual = LIVRE; estadoExplora = EXPLORA_LIVRE; estadoDesvioLinha = DESVIO_LINHA_LIVRE; total_waypoints = 0;
                 if (ws.count() > 0) ws.textAll("{\"alert\":\"LOW_BATTERY\"}");
             }
             digitalWrite(PINO_LED, (millis() / 150) % 2 ? HIGH : LOW);
