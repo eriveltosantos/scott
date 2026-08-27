@@ -1557,7 +1557,7 @@ void verificarSegurancaBateria() {
             digitalWrite(PINO_LED, (millis() / 150) % 2 ? HIGH : LOW);
         }
     } 
-    else if (tensao_mv >= (TENSAO_CRITICA + 300)) { 
+    else if (tensao_mv >= (TENSAO_CRITICA + 300)) {  
         leituras_criticas_consecutivas = 0; modoSegurancaBateria = false; digitalWrite(PINO_LED, LOW);
     }
 }
