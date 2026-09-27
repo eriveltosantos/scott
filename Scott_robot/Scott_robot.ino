@@ -55,7 +55,8 @@ int sentido_giro_way = 1;
 
 // --- ANTI-STALL DA NAVEGAÇÃO POR WAYPOINT ---
 const uint32_t TIMEOUT_GIRO_WAYPOINT = 4000;         
-const uint32_t EMPURRAO_ANTISTALL_WAYPOINT_MS = 1200; 
+const uint32_t TEMPO_RE_ANTISTALL_WAYPOINT_MS = 500; 
+const uint32_t TEMPO_AVANCO_ANTISTALL_WAYPOINT_MS = 800; 
 const int LIMITE_GIROS_ANTISTALL_WAYPOINT = 4;       
 int giros_consecutivos_way = 0;
 
@@ -903,11 +904,13 @@ void atualizar_odometria_fusao() {
     float dist_centro = 0.0;
     float delta_theta = 0.0;
 
-    // Estimativas de 30 cm/s para avanço e 1.5 rad/s para giro (ajuste se necessário)
+    // Estimativas: 30 cm/s avanço pleno, 15 cm/s pivô em arco, 1.5 rad/s para giro
     if (sinal_esq == 1 && sinal_dir == 1) { dist_centro = 30.0 * dt; }
     else if (sinal_esq == -1 && sinal_dir == -1) { dist_centro = -30.0 * dt; }
-    else if (sinal_esq == -1 && sinal_dir == 1) { delta_theta = 1.5 * dt; }
-    else if (sinal_esq == 1 && sinal_dir == -1) { delta_theta = -1.5 * dt; }
+    else if (sinal_esq == -1 && sinal_dir == 1) { delta_theta = -1.5 * dt; } // Giro anti-horário (reduz curso em graus)
+    else if (sinal_esq == 1 && sinal_dir == -1) { delta_theta = 1.5 * dt; }  // Giro horário (aumenta curso em graus)
+    else if (sinal_esq == 1 && sinal_dir == 0) { dist_centro = 15.0 * dt; delta_theta = 1.5 * dt; }  // Pivô horário avançando
+    else if (sinal_esq == 0 && sinal_dir == 1) { dist_centro = 15.0 * dt; delta_theta = -1.5 * dt; } // Pivô anti-horário avançando
 
     theta_rad += delta_theta;
     while (theta_rad >= TWO_PI) theta_rad -= TWO_PI; 
@@ -1402,8 +1405,11 @@ void navega_waypoints() {
   if (erro_angular < -180.0) erro_angular += 360.0;
   if (erro_angular > 180.0) erro_angular -= 360.0;
 
-  if (abs(erro_angular) > 50.0) {
-      if (estado_motor_anterior == 0) { parar_motores(); delay(250); tempo_inicio_manobra_way = millis(); }
+  // Histerese para curva em arco: entra com erro > 45° e permanece até o erro cair para < 25°
+  bool precisa_curva_fechada = (estado_motor_anterior == 1) ? (abs(erro_angular) >= 25.0) : (abs(erro_angular) > 45.0);
+
+  if (precisa_curva_fechada) {
+      if (estado_motor_anterior == 0) { parar_motores(); delay(200); tempo_inicio_manobra_way = millis(); }
       estado_motor_anterior = 1;
 
       if (millis() - tempo_inicio_manobra_way > TIMEOUT_GIRO_WAYPOINT) {
@@ -1416,20 +1422,29 @@ void navega_waypoints() {
               return;
           }
 
-          if (ws.count() > 0) ws.textAll("{\"waypoint_status\":\"Anti-stall: forcando tracao reto\"}");
+          if (ws.count() > 0) ws.textAll("{\"waypoint_status\":\"Anti-stall: liberando tracao (re + avanco)\"}");
+          parar_motores(); delay(150);
+          mover_motores(-VELOCIDADE_MAXIMA, -VELOCIDADE_MAXIMA);
+          delay(TEMPO_RE_ANTISTALL_WAYPOINT_MS);
           parar_motores(); delay(150);
           mover_motores(VELOCIDADE_MAXIMA, VELOCIDADE_MAXIMA);
-          delay(EMPURRAO_ANTISTALL_WAYPOINT_MS);
+          delay(TEMPO_AVANCO_ANTISTALL_WAYPOINT_MS);
           parar_motores(); delay(150);
           estado_motor_anterior = 0;
           tempo_inicio_manobra_way = millis();
           return;
       }
 
-      int sentido = (erro_angular > 0) ? 1 : -1;
-      mover_motores(65 * sentido, -65 * sentido); 
+      // Curva em pivô avançando: roda externa em 100% e interna parada (0%)
+      if (erro_angular > 0) {
+          // Virar para a direita (sentido horário): roda esquerda avança a 100%, direita parada
+          mover_motores(VELOCIDADE_MAXIMA, 0);
+      } else {
+          // Virar para a esquerda (sentido anti-horário): roda direita avança a 100%, esquerda parada
+          mover_motores(0, VELOCIDADE_MAXIMA);
+      }
   } else {
-      if (estado_motor_anterior == 1) { parar_motores(); delay(250); }
+      if (estado_motor_anterior == 1) { parar_motores(); delay(200); }
       estado_motor_anterior = 0;
       giros_consecutivos_way = 0;
 
